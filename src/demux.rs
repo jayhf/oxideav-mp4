@@ -8,6 +8,8 @@
 //!
 //! `next_packet` then serves them in order by seeking into the mdat.
 
+mod video_config;
+
 use std::collections::HashSet;
 use std::io::SeekFrom;
 
@@ -19,12 +21,12 @@ use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::boxes::*;
 use crate::cenc::{
-    parse_piff_pssh, parse_piff_senc, parse_piff_tenc, parse_pssh, parse_senc, parse_tenc,
-    PiffSencBox, PiffTencBox, PsshBox, SencBox, TencBox, PIFF_PSSH_USERTYPE, PIFF_SENC_USERTYPE,
-    PIFF_TENC_USERTYPE,
+    PIFF_PSSH_USERTYPE, PIFF_SENC_USERTYPE, PIFF_TENC_USERTYPE, PiffSencBox, PiffTencBox, PsshBox,
+    SencBox, TencBox, parse_piff_pssh, parse_piff_senc, parse_piff_tenc, parse_pssh, parse_senc,
+    parse_tenc,
 };
 use crate::codec_id::{from_sample_entry, from_sample_entry_with_oti};
-use crate::emsg::{parse_emsg_box, EmsgBox};
+use crate::emsg::{EmsgBox, parse_emsg_box};
 
 pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     Ok(Box::new(open_typed(input, codecs)?))
@@ -247,8 +249,17 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let movie_timescale = parsed.movie_timescale;
     for t in &mut parsed.tracks {
         t.elst_timeline = build_elst_timeline(&t.elst, movie_timescale, t.timescale);
+        fix_legacy_pcm_sample_sizes(t);
     }
     let parsed = parsed;
+    // Big-endian PCM tracks are delivered little-endian (the PCM
+    // codecs are little-endian): bytes per sample to reverse, per
+    // stream.
+    let pcm_swap: Vec<usize> = parsed
+        .tracks
+        .iter()
+        .map(|t| t.pcm.map_or(0, |l| l.swap_width()))
+        .collect();
 
     let mut streams: Vec<StreamInfo> = Vec::with_capacity(parsed.tracks.len());
     let mut samples: Vec<SampleRef> = Vec::new();
@@ -369,6 +380,27 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let mut metadata = parsed.metadata;
     if let Some(d) = parsed.mehd_fragment_duration {
         metadata.push(("mehd_fragment_duration".to_string(), d.to_string()));
+    }
+
+    // §8.2.2 mvhd creation / modification timestamps, in the box's own
+    // units (seconds since 1904-01-01 UTC) so the flat channel says
+    // exactly what the file says. Both keys are emitted only when the
+    // value is non-zero: zero is the "producer left it unset" encoding
+    // that the majority of files (including this crate's own default
+    // output) carry, and emitting it everywhere would be noise rather
+    // than information. The typed pair is always available through
+    // `Mp4Demuxer::mvhd_timestamps`.
+    if parsed.movie_timestamps.creation_time != 0 {
+        metadata.push((
+            "mvhd_creation_time".to_string(),
+            parsed.movie_timestamps.creation_time.to_string(),
+        ));
+    }
+    if parsed.movie_timestamps.modification_time != 0 {
+        metadata.push((
+            "mvhd_modification_time".to_string(),
+            parsed.movie_timestamps.modification_time.to_string(),
+        ));
     }
 
     // Surface a parsed `pdin` (ProgressiveDownloadInfoBox, §8.1.3) on
@@ -612,13 +644,13 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // keys are emitted.
     if let Some(declared) = mfro_size {
         metadata.push(("mfro_size".to_string(), declared.to_string()));
-        if let Some(actual) = mfra_actual_size {
-            if declared as u64 != actual {
-                metadata.push((
-                    "mfro_size_mismatch".to_string(),
-                    format!("declared={declared} actual={actual}"),
-                ));
-            }
+        if let Some(actual) = mfra_actual_size
+            && declared as u64 != actual
+        {
+            metadata.push((
+                "mfro_size_mismatch".to_string(),
+                format!("declared={declared} actual={actual}"),
+            ));
         }
     }
 
@@ -807,6 +839,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     Ok(Mp4Demuxer {
         input,
         input_len: file_size,
+        pcm_swap,
         streams,
         samples,
         cursor: 0,
@@ -847,6 +880,9 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             .iter()
             .map(|t| t.elst.iter().map(elst_entry_to_public).collect())
             .collect(),
+        mvhd_timestamps: parsed.movie_timestamps,
+        tkhd_timestamps: parsed.tracks.iter().map(|t| t.tkhd_timestamps).collect(),
+        mdhd_timestamps: parsed.tracks.iter().map(|t| t.mdhd_timestamps).collect(),
         last_sdi: None,
     })
 }
@@ -1000,7 +1036,7 @@ pub struct TfraEntry {
 /// box that follows it in bitstream order (§8.16.5.1 placement rule),
 /// so a low-latency DASH/CMAF live consumer can match production
 /// wall-clock to media presentation time.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrftRecord {
     /// `track_ID` of the reference track whose `media_time` this box
     /// annotates (§8.16.5.3 reference_track_ID).
@@ -1263,7 +1299,7 @@ pub struct PdinEntry {
 ///
 /// Quantity is zero or one per file (§8.1.3.1); the demuxer collects
 /// the first instance and ignores any subsequent ones.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PdinRecord {
     /// Pairs in file order, mirroring §8.1.3.2's loop ordering.
     /// A consumer searching by rate should sort if a non-monotonic
@@ -1361,7 +1397,7 @@ pub struct LevaEntry {
 /// the first instance seen inside `mvex` and ignores any subsequent
 /// copies (a malformed file with two leva boxes is no reason to abort
 /// the parse — the first is the one the spec endorses).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LevaRecord {
     /// Entries in file order, mirroring §8.8.13.2's loop ordering.
     /// The §8.8.13.3 sequence rule on `assignment_type` ordering is
@@ -1446,7 +1482,7 @@ pub struct TrepChild {
 /// A `trep` with a malformed FullBox preamble or a truncated `track_id`
 /// is dropped rather than aborting the parse, matching the treatment of
 /// the sibling optional `mvex` boxes (`mehd`, `leva`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrepRecord {
     /// `track_id` (§8.8.15.3) — the track for which these extension
     /// properties are provided. Carried verbatim; track 0 is not a
@@ -1459,11 +1495,74 @@ pub struct TrepRecord {
     pub children: Vec<TrepChild>,
 }
 
+/// The `creation_time` / `modification_time` pair carried by each of
+/// the three ISOBMFF header boxes — `mvhd` (§8.2.2), `tkhd` (§8.3.2)
+/// and `mdhd` (§8.4.2).
+///
+/// Both values are seconds since 1904-01-01 UTC — the ISOBMFF header
+/// epoch, exactly as the box records them, matching the write side's
+/// [`Mp4MuxerOptions::creation_time`](crate::options::Mp4MuxerOptions::creation_time).
+/// [`unix_secs_from_mp4_secs`](crate::options::unix_secs_from_mp4_secs)
+/// reaches a Unix timestamp. Version 0 carries the pair as 32-bit
+/// fields and version 1 as 64-bit; both widen to `u64` here. Zero is
+/// the conventional "unset" value — see [`is_unset`](Self::is_unset).
+///
+/// Not to be confused with the ISO/IEC 23008-12 `crtt` / `mdft` item
+/// properties, which share the 1904 origin but count microseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HeaderTimestamps {
+    /// `creation_time` — seconds since 1904-01-01 UTC.
+    pub creation_time: u64,
+    /// `modification_time` — seconds since 1904-01-01 UTC.
+    pub modification_time: u64,
+}
+
+impl HeaderTimestamps {
+    /// A pair with both halves given, in seconds since 1904-01-01 UTC.
+    pub fn new(creation_time: u64, modification_time: u64) -> Self {
+        Self {
+            creation_time,
+            modification_time,
+        }
+    }
+
+    /// The common shape: one instant in both `creation_time` and
+    /// `modification_time` (a file created and last modified at once).
+    pub fn stamped(time: u64) -> Self {
+        Self::new(time, time)
+    }
+
+    /// Replace the `creation_time` half.
+    pub fn with_creation_time(mut self, creation_time: u64) -> Self {
+        self.creation_time = creation_time;
+        self
+    }
+
+    /// Replace the `modification_time` half.
+    pub fn with_modification_time(mut self, modification_time: u64) -> Self {
+        self.modification_time = modification_time;
+        self
+    }
+
+    /// `true` when both fields are zero — the "producer did not stamp
+    /// this box" encoding. Distinguishing it from a genuine
+    /// 1904-01-01 stamp is not possible in the format, and no real
+    /// file means the latter.
+    pub fn is_unset(&self) -> bool {
+        self.creation_time == 0 && self.modification_time == 0
+    }
+}
+
 #[derive(Default)]
 struct ParsedMoov {
     tracks: Vec<Track>,
     movie_timescale: u32,
     movie_duration: u64,
+    /// §8.2.2 `mvhd` header timestamps for the movie as a whole.
+    /// Defaults to the all-zero "unset" pair when the file leaves them
+    /// blank, which is the common case.
+    movie_timestamps: HeaderTimestamps,
     /// §8.8.2 (`mehd` MovieExtendsHeaderBox) — overall presentation
     /// duration of a fragmented movie, including fragments, in the
     /// movie timescale. `None` when the box is absent (per the spec
@@ -1523,10 +1622,24 @@ struct Track {
     /// Per-track timescale (ticks per second).
     timescale: u32,
     duration: Option<u64>,
+    /// §8.3.2 `tkhd` header timestamps for this track.
+    tkhd_timestamps: HeaderTimestamps,
+    /// §8.4.2 `mdhd` header timestamps for this track's media. A
+    /// producer may stamp these differently from the `tkhd` pair
+    /// (`mdhd` describes when the *media* was created, `tkhd` the
+    /// track), so both are kept rather than collapsed.
+    mdhd_timestamps: HeaderTimestamps,
     // Audio
     channels: Option<u16>,
     sample_rate: Option<u32>,
     sample_size_bits: Option<u16>,
+    /// `stsd` FullBox version (§8.5.2.2): 1 when the box may hold
+    /// `AudioSampleEntryV1` entries.
+    stsd_version: u8,
+    /// Uncompressed-audio layout of the active sample entry (ISO/IEC
+    /// 23003-5 `ipcm` / `fpcm`, QuickTime `sowt` / `twos` / `lpcm` /
+    /// `in24` / `in32` / `fl32` / `fl64` / `raw `), when it is one.
+    pcm: Option<PcmLayout>,
     // Video
     width: Option<u32>,
     height: Option<u32>,
@@ -2186,7 +2299,7 @@ pub struct SubSampleEntry {
 /// One entry of a `subs` (SubSampleInformationBox, §8.7.7) — a single
 /// sample's sub-sample table together with the sparse delta that
 /// addresses it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubsEntry {
     /// §8.7.7.3 — sample-number delta from the previous entry's sample
     /// (or from sample 0 for the first entry). The decoded absolute
@@ -2211,7 +2324,7 @@ pub struct SubsEntry {
 /// spec mandates that each carry a distinct `flags` value (§8.7.7.1).
 /// We preserve both as-recorded so codec-specific consumers can pick
 /// the table whose semantics they understand.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubsBox {
     /// FullBox version (0 or 1) — determines `subsample_size` width on
     /// disk. We normalise to `u32` in `SubSampleEntry::subsample_size`.
@@ -2245,7 +2358,7 @@ pub struct SubsBox {
 /// sample. `sample_count` is stored so an over-long table (the spec
 /// permits `sample_count` < total stsz/stz2 count — auxiliary info
 /// supplied for the initial samples only) is preserved verbatim.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SaizBox {
     /// §8.7.8.3 `aux_info_type` — present only when `flags & 1` is set.
     pub aux_info_type: Option<[u8; 4]>,
@@ -2281,7 +2394,7 @@ pub struct SaizBox {
 /// widened to `u64` so callers handle one shape. `version` is preserved
 /// so a producer round-tripping back to disk can re-emit the same
 /// width.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SaioBox {
     /// FullBox version (0 or 1) — selects 32-bit / 64-bit on-disk
     /// offset width. Preserved so a round-trip can match the original
@@ -2969,10 +3082,11 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
             // dropped, not fatal. Unknown usertypes are skipped.
             UUID => {
                 let body = read_bytes_vec(&mut cur, psz)?;
-                if body.len() >= 16 && body[..16] == PIFF_PSSH_USERTYPE {
-                    if let Ok(p) = parse_piff_pssh(&body[16..]) {
-                        out.piff_psshes.push(p);
-                    }
+                if body.len() >= 16
+                    && body[..16] == PIFF_PSSH_USERTYPE
+                    && let Ok(p) = parse_piff_pssh(&body[16..])
+                {
+                    out.piff_psshes.push(p);
                 }
             }
             _ => {
@@ -3041,10 +3155,10 @@ fn parse_mvex(
             // non-fatal: dropped, file remains parseable.
             LEVA => {
                 let b = read_bytes_vec(&mut cur, psz)?;
-                if leva.is_none() {
-                    if let Ok(r) = parse_leva(&b) {
-                        *leva = Some(r);
-                    }
+                if leva.is_none()
+                    && let Ok(r) = parse_leva(&b)
+                {
+                    *leva = Some(r);
                 }
             }
             // §8.8.15 — `trep` TrackExtensionPropertiesBox. Optional
@@ -3126,8 +3240,41 @@ fn parse_trex(body: &[u8], tracks: &mut [Track]) -> Result<()> {
     Ok(())
 }
 
+/// Read the `creation_time` / `modification_time` pair that opens the
+/// body of every ISOBMFF header box (`mvhd` §8.2.2, `tkhd` §8.3.2,
+/// `mdhd` §8.4.2) right after the 4-byte FullBox preamble: two u32s at
+/// version 0, two u64s at version 1. All three boxes share this
+/// prefix, so one reader serves them.
+///
+/// Returns the all-zero (unset) pair when the body is too short to
+/// hold it. No caller can reach that path today — each parser's own
+/// length check is stricter than this one — but the guard keeps the
+/// helper correct on its own terms rather than on its callers'.
+fn read_header_timestamps(body: &[u8], version: u8) -> HeaderTimestamps {
+    let need = if version == 0 { 12 } else { 20 };
+    if body.len() < need {
+        return HeaderTimestamps::default();
+    }
+    if version == 0 {
+        HeaderTimestamps {
+            creation_time: u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as u64,
+            modification_time: u32::from_be_bytes([body[8], body[9], body[10], body[11]]) as u64,
+        }
+    } else {
+        HeaderTimestamps {
+            creation_time: u64::from_be_bytes([
+                body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
+            ]),
+            modification_time: u64::from_be_bytes([
+                body[12], body[13], body[14], body[15], body[16], body[17], body[18], body[19],
+            ]),
+        }
+    }
+}
+
 /// ISO/IEC 14496-12 §8.2.2 Movie Header box. Carries the movie-wide
-/// timescale and duration (in that timescale).
+/// timescale and duration (in that timescale), plus the movie's
+/// creation / modification timestamps.
 fn parse_mvhd(body: &[u8], out: &mut ParsedMoov) -> Result<()> {
     if body.is_empty() {
         return Err(Error::invalid("MP4: mvhd empty"));
@@ -3152,6 +3299,7 @@ fn parse_mvhd(body: &[u8], out: &mut ParsedMoov) -> Result<()> {
     };
     out.movie_timescale = timescale;
     out.movie_duration = duration;
+    out.movie_timestamps = read_header_timestamps(body, version);
     Ok(())
 }
 
@@ -3301,8 +3449,8 @@ fn ilst_key_for(fourcc: &[u8; 4]) -> Option<&'static str> {
 fn decode_utf8_or_utf16(buf: &[u8]) -> String {
     if buf.len() >= 2 && buf[0] == 0xFE && buf[1] == 0xFF {
         // UTF-16BE with BOM.
-        let pairs = buf[2..].chunks_exact(2);
-        let units: Vec<u16> = pairs.map(|p| u16::from_be_bytes([p[0], p[1]])).collect();
+        let pairs = buf[2..].as_chunks::<2>().0.iter();
+        let units: Vec<u16> = pairs.map(|p| u16::from_be_bytes(*p)).collect();
         return String::from_utf16_lossy(&units)
             .trim_end_matches('\0')
             .trim()
@@ -4035,10 +4183,10 @@ pub fn parse_iinf_box(body: &[u8]) -> Option<IinfBox> {
             break;
         }
         cur.set_position((start + psz) as u64);
-        if hdr.fourcc == INFE {
-            if let Some(e) = parse_infe(&region[start..start + psz]) {
-                out.entries.push(e);
-            }
+        if hdr.fourcc == INFE
+            && let Some(e) = parse_infe(&region[start..start + psz])
+        {
+            out.entries.push(e);
         }
         seen += 1;
     }
@@ -5337,9 +5485,13 @@ fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
         codec_id_fourcc: [0; 4],
         timescale: 0,
         duration: None,
+        tkhd_timestamps: HeaderTimestamps::default(),
+        mdhd_timestamps: HeaderTimestamps::default(),
         channels: None,
         sample_rate: None,
         sample_size_bits: None,
+        stsd_version: 0,
+        pcm: None,
         width: None,
         height: None,
         extradata: Vec::new(),
@@ -5442,11 +5594,7 @@ fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
             }
         }
     }
-    if has_media {
-        Ok(Some(t))
-    } else {
-        Ok(None)
-    }
+    if has_media { Ok(Some(t)) } else { Ok(None) }
 }
 
 /// Walk a *track-level* `udta` body and pick up any boxes whose semantics
@@ -5865,10 +6013,10 @@ fn parse_strd(body: &[u8]) -> Vec<SubTrackSampleGroup> {
         }
         let start = cur.position() as usize;
         cur.set_position((start + psz) as u64);
-        if hdr.fourcc == STSG {
-            if let Some(sg) = parse_stsg(&body[start..start + psz]) {
-                out.push(sg);
-            }
+        if hdr.fourcc == STSG
+            && let Some(sg) = parse_stsg(&body[start..start + psz])
+        {
+            out.push(sg);
         }
     }
     out
@@ -6021,6 +6169,7 @@ fn parse_tkhd(body: &[u8], t: &mut Track) -> Result<()> {
         return Err(Error::invalid("MP4: tkhd too short"));
     }
     t.track_id = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+    t.tkhd_timestamps = read_header_timestamps(body, version);
     Ok(())
 }
 
@@ -6064,7 +6213,7 @@ fn parse_tref(body: &[u8], t: &mut Track) -> Result<()> {
             return Err(Error::invalid("MP4: tref child not a multiple of 4 bytes"));
         }
         let mut ids = Vec::with_capacity(child.len() / 4);
-        for chunk in child.chunks_exact(4) {
+        for chunk in child.as_chunks::<4>().0 {
             let id = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             if id != 0 {
                 ids.push(id);
@@ -6396,12 +6545,12 @@ pub fn build_elst_box(entries: &[EditListEntry]) -> Result<Vec<u8>> {
             "MP4: elst with no entries (omit the box instead)",
         ));
     }
-    if let Some(last) = entries.last() {
-        if last.is_empty_edit() {
-            return Err(Error::invalid(
-                "MP4: the last edit in a track shall never be an empty edit (§8.6.6.3)",
-            ));
-        }
+    if let Some(last) = entries.last()
+        && last.is_empty_edit()
+    {
+        return Err(Error::invalid(
+            "MP4: the last edit in a track shall never be an empty edit (§8.6.6.3)",
+        ));
     }
     let mut use_v1 = false;
     for e in entries {
@@ -6496,6 +6645,7 @@ fn parse_mdhd(body: &[u8], t: &mut Track) -> Result<()> {
     };
     t.timescale = timescale;
     t.duration = Some(duration);
+    t.mdhd_timestamps = read_header_timestamps(body, version);
     Ok(())
 }
 
@@ -6518,10 +6668,10 @@ fn parse_elng(body: &[u8], t: &mut Track) {
     // Take everything up to the first NUL terminator (or the whole
     // remainder if no NUL is present).
     let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
-    if let Ok(tag) = std::str::from_utf8(&s[..end]) {
-        if !tag.is_empty() {
-            t.elng = Some(tag.to_string());
-        }
+    if let Ok(tag) = std::str::from_utf8(&s[..end])
+        && !tag.is_empty()
+    {
+        t.elng = Some(tag.to_string());
     }
 }
 
@@ -6567,10 +6717,10 @@ fn parse_minf(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
                 let sub = read_bytes_vec(&mut cur, psz)?;
                 // §12.1.2 fixes the quantity at exactly one; keep the
                 // first instance seen and ignore any stray duplicates.
-                if t.vmhd.is_none() {
-                    if let Ok(v) = parse_vmhd(&sub) {
-                        t.vmhd = Some(v);
-                    }
+                if t.vmhd.is_none()
+                    && let Ok(v) = parse_vmhd(&sub)
+                {
+                    t.vmhd = Some(v);
                 }
             }
             HMHD => {
@@ -6579,10 +6729,10 @@ fn parse_minf(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
                 // `minf`; keep the first parseable `hmhd` and ignore stray
                 // duplicates. A malformed one is dropped (informational —
                 // the track still demuxes), so the walk never aborts.
-                if t.hmhd.is_none() {
-                    if let Ok(h) = parse_hmhd(&sub) {
-                        t.hmhd = Some(h);
-                    }
+                if t.hmhd.is_none()
+                    && let Ok(h) = parse_hmhd(&sub)
+                {
+                    t.hmhd = Some(h);
                 }
             }
             GMHD => {
@@ -6606,10 +6756,10 @@ fn parse_minf(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
                 // still demuxes against the single-source default), so the
                 // dinf walk never aborts the surrounding `minf` parse.
                 let sub = read_bytes_vec(&mut cur, psz)?;
-                if t.dref.is_none() {
-                    if let Some(d) = parse_dinf(&sub) {
-                        t.dref = Some(d);
-                    }
+                if t.dref.is_none()
+                    && let Some(d) = parse_dinf(&sub)
+                {
+                    t.dref = Some(d);
                 }
             }
             _ => skip_cursor_bytes(&mut cur, psz),
@@ -7005,7 +7155,16 @@ pub fn build_tcmi_box(r: &TcmiBox) -> Vec<u8> {
         body.extend_from_slice(&c.to_be_bytes());
     }
     let name = r.font_name.as_bytes();
-    let n = name.len().min(255);
+    // The Pascal length byte caps the wire name at 255 bytes. A record
+    // name can legitimately exceed that (a wire name of up to 255
+    // non-UTF-8 bytes expands up to threefold under the parser's lossy
+    // replacement), so truncate — but only at a char boundary, so the
+    // emitted bytes are valid UTF-8 and reparse cleanly instead of
+    // growing a replacement-character tail.
+    let mut n = name.len().min(255);
+    while n > 0 && !r.font_name.is_char_boundary(n) {
+        n -= 1;
+    }
     body.push(n as u8);
     body.extend_from_slice(&name[..n]);
     wrap_box(&TCMI, &body)
@@ -7161,7 +7320,13 @@ pub fn build_text_sample_entry(r: &TextSampleEntry, data_reference_index: u16) -
         body.extend_from_slice(&c.to_be_bytes());
     }
     let name = r.text_name.as_bytes();
-    let n = name.len().min(255);
+    // Pascal length byte: cap at 255 wire bytes, truncating only at a
+    // char boundary (see `build_tcmi_box` — over-long names arise from
+    // the parser's lossy replacement of non-UTF-8 wire names).
+    let mut n = name.len().min(255);
+    while n > 0 && !r.text_name.is_char_boundary(n) {
+        n -= 1;
+    }
     body.push(n as u8);
     body.extend_from_slice(&name[..n]);
     wrap_box(b"text", &body)
@@ -7253,6 +7418,7 @@ fn parse_stsd(body: &[u8], t: &mut Track) -> Result<()> {
         return Err(Error::invalid("MP4: stsd too short"));
     }
     let entry_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    t.stsd_version = body[0];
     if entry_count == 0 {
         return Ok(());
     }
@@ -7659,17 +7825,116 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
     t.sample_size_bits = Some(sample_size);
     t.sample_rate = Some(sample_rate);
 
-    // Child boxes (dfLa, dOps, esds, ...).
-    let mut cur = std::io::Cursor::new(&entry[28..]);
-    let end = (entry.len() - 28) as u64;
-    while cur.position() < end {
+    // Where the child boxes start, by entry version:
+    // * ISO/IEC 14496-12 §8.5.2.2 AudioSampleEntryV1 (entry version 1
+    //   inside an `stsd` of version 1) keeps the 28-byte layout;
+    // * QuickTime sound description v1 (version 1 in a version-0
+    //   `stsd`) appends samplesPerPacket / bytesPerPacket /
+    //   bytesPerFrame / bytesPerSample (4 × u32);
+    // * QuickTime sound description v2 replaces the tail with a
+    //   36-byte block carrying a Float64 sample rate, a 32-bit channel
+    //   count, constBitsPerChannel and the LPCM formatSpecificFlags
+    //   (QTFF 2012 "Sound Sample Description (Version 2)").
+    let entry_version = u16::from_be_bytes([entry[8], entry[9]]);
+    let mut children_at = 28;
+    let mut hints = PcmHints::default();
+    match entry_version {
+        1 if t.stsd_version == 0 && entry.len() >= 44 => children_at = 44,
+        2 if entry.len() >= 64 => {
+            let be32 =
+                |o: usize| u32::from_be_bytes([entry[o], entry[o + 1], entry[o + 2], entry[o + 3]]);
+            let rate = f64::from_bits(u64::from_be_bytes([
+                entry[32], entry[33], entry[34], entry[35], entry[36], entry[37], entry[38],
+                entry[39],
+            ]));
+            if rate.is_finite() && rate >= 1.0 && rate <= f64::from(u32::MAX) {
+                t.sample_rate = Some(rate.round() as u32);
+            }
+            if let Ok(ch) = u16::try_from(be32(40)) {
+                t.channels = Some(ch);
+            }
+            let bits = be32(48);
+            if let Ok(b) = u16::try_from(bits)
+                && b != 0
+            {
+                t.sample_size_bits = Some(b);
+            }
+            hints.lpcm_flags = Some(be32(52));
+            children_at = 64;
+        }
+        _ => {}
+    }
+
+    parse_audio_children(&entry[children_at..], t, &mut hints)?;
+    t.pcm = PcmLayout::for_entry(&t.codec_id_fourcc, t.sample_size_bits, &hints);
+    Ok(())
+}
+
+/// QuickTime convention for uncompressed audio in version-0 sound
+/// descriptions: the sample table counts one "sample" per PCM frame
+/// but records a constant sample size of 1 byte. Each sample really
+/// spans one frame (`channels × bytes per sample`), so the sizes are
+/// rewritten before the sample offsets are derived from them.
+fn fix_legacy_pcm_sample_sizes(t: &mut Track) {
+    let Some(layout) = t.pcm else {
+        return;
+    };
+    let frame = u32::from(t.channels.unwrap_or(1).max(1)) * u32::from(layout.bits.div_ceil(8));
+    if frame > 1 && !t.stsz.is_empty() && t.stsz.iter().all(|&s| s == 1) {
+        t.stsz.fill(frame);
+    }
+}
+
+/// PCM facts collected from a sample entry's tail and child boxes.
+#[derive(Default)]
+struct PcmHints {
+    /// ISO/IEC 23003-5 `pcmC`: `(format_flags, PCM_sample_size)`.
+    pcmc: Option<(u8, u8)>,
+    /// QuickTime v2 `formatSpecificFlags` (LPCM flag values).
+    lpcm_flags: Option<u32>,
+    /// QuickTime `enda` (inside `wave`): non-zero = little-endian.
+    little_endian: Option<bool>,
+}
+
+/// Walk an audio sample entry's child boxes (and the boxes nested in a
+/// QuickTime `wave` decompression-parameters atom).
+fn parse_audio_children(buf: &[u8], t: &mut Track, hints: &mut PcmHints) -> Result<()> {
+    let mut cur = std::io::Cursor::new(buf);
+    let end = buf.len() as u64;
+    while cur.position() + 8 <= end {
         let hdr = match read_box_header(&mut cur)? {
             Some(h) => h,
             None => break,
         };
+        // QuickTime terminator atom (size 8, type 0) ends the list.
+        if hdr.fourcc == [0; 4] {
+            break;
+        }
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         let body = read_bytes_vec(&mut cur, psz)?;
         match &hdr.fourcc {
+            // ISO/IEC 23003-5 PCMConfig: FullBox + format_flags (bit 0
+            // set = little-endian) + PCM_sample_size (bits).
+            b"pcmC" if body.len() >= 6 => {
+                hints.pcmc = Some((body[4], body[5]));
+            }
+            // ISO/IEC 14496-12 §12.2.3 SamplingRateBox: FullBox + the
+            // 32-bit sampling rate, authoritative over the 16.16
+            // `samplerate` field of an AudioSampleEntryV1.
+            b"srat" if body.len() >= 8 => {
+                let rate = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+                if rate > 0 {
+                    t.sample_rate = Some(rate);
+                }
+            }
+            // QuickTime `wave` (siDecompressionParam): nested atoms —
+            // `frma`, `enda`, `esds`, … — then a terminator.
+            b"wave" => parse_audio_children(&body, t, hints)?,
+            // QuickTime `enda`: 16-bit flag, non-zero = little-endian
+            // samples (for `in24` / `in32` / `fl32` / `fl64`).
+            b"enda" if body.len() >= 2 => {
+                hints.little_endian = Some(u16::from_be_bytes([body[0], body[1]]) != 0);
+            }
             // FLAC-in-MP4 dfLa: 1 byte version + 3 bytes flags + metadata blocks.
             // Our FLAC decoder wants just the metadata blocks.
             b"dfLa" if body.len() > 4 => {
@@ -7722,6 +7987,128 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Layout of uncompressed audio samples in a track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PcmLayout {
+    /// Bits per sample (8 / 16 / 24 / 32 / 64).
+    bits: u16,
+    float: bool,
+    signed: bool,
+    big_endian: bool,
+}
+
+impl PcmLayout {
+    /// The layout a sample entry of type `fourcc` declares, `None` for
+    /// compressed formats or a layout without a codec here.
+    fn for_entry(fourcc: &[u8; 4], sample_size: Option<u16>, h: &PcmHints) -> Option<Self> {
+        let int = |bits: u16, big_endian: bool| PcmLayout {
+            bits,
+            float: false,
+            signed: true,
+            big_endian,
+        };
+        let float = |bits: u16, big_endian: bool| PcmLayout {
+            bits,
+            float: true,
+            signed: true,
+            big_endian,
+        };
+        let qt_le = h.little_endian.unwrap_or(false);
+        let layout = match fourcc {
+            // ISO/IEC 23003-5: integer / IEEE-float PCM, endianness and
+            // sample size from `pcmC`.
+            b"ipcm" | b"fpcm" => {
+                let (flags, bits) = h.pcmc?;
+                let le = flags & 1 != 0;
+                if fourcc == b"fpcm" {
+                    float(u16::from(bits), !le)
+                } else {
+                    int(u16::from(bits), !le)
+                }
+            }
+            // QuickTime: `sowt` little-endian / `twos` big-endian
+            // signed integers, 8 or 16 bits (`samplesize`).
+            b"sowt" => int(sample_size.unwrap_or(16), false),
+            b"twos" => int(sample_size.unwrap_or(16), true),
+            // QuickTime `raw `: 8-bit offset-binary (unsigned).
+            b"raw " if sample_size.unwrap_or(8) == 8 => PcmLayout {
+                bits: 8,
+                float: false,
+                signed: false,
+                big_endian: false,
+            },
+            // QuickTime `in24` / `in32` / `fl32` / `fl64`: big-endian
+            // unless an `enda` atom says little-endian.
+            b"in24" => int(24, !qt_le),
+            b"in32" => int(32, !qt_le),
+            b"fl32" => float(32, !qt_le),
+            b"fl64" => float(64, !qt_le),
+            // QuickTime v2 `lpcm`: LPCM flag values — IsFloat (0x1),
+            // IsBigEndian (0x2), IsSignedInteger (0x4) — and
+            // constBitsPerChannel.
+            b"lpcm" => {
+                let flags = h.lpcm_flags?;
+                PcmLayout {
+                    bits: sample_size?,
+                    float: flags & 0x1 != 0,
+                    signed: flags & 0x1 != 0 || flags & 0x4 != 0,
+                    big_endian: flags & 0x2 != 0,
+                }
+            }
+            _ => return None,
+        };
+        layout.codec_id().map(|_| layout)
+    }
+
+    /// The (little-endian) PCM codec carrying these samples once the
+    /// demuxer has put them in little-endian order.
+    fn codec_id(&self) -> Option<&'static str> {
+        Some(match (self.float, self.bits, self.signed) {
+            (true, 32, _) => "pcm_f32le",
+            (true, 64, _) => "pcm_f64le",
+            (false, 8, true) => "pcm_s8",
+            (false, 8, false) => "pcm_u8",
+            (false, 16, true) => "pcm_s16le",
+            (false, 24, true) => "pcm_s24le",
+            (false, 32, true) => "pcm_s32le",
+            _ => return None,
+        })
+    }
+
+    fn sample_format(&self) -> Option<SampleFormat> {
+        Some(match self.codec_id()? {
+            "pcm_f32le" => SampleFormat::F32,
+            "pcm_f64le" => SampleFormat::F64,
+            "pcm_s8" => SampleFormat::S8,
+            "pcm_u8" => SampleFormat::U8,
+            "pcm_s16le" => SampleFormat::S16,
+            "pcm_s24le" => SampleFormat::S24,
+            _ => SampleFormat::S32,
+        })
+    }
+
+    /// Bytes per sample to reverse when the stored order is big-endian
+    /// (0 = samples are already little-endian / single bytes).
+    fn swap_width(&self) -> usize {
+        if self.big_endian && self.bits > 8 {
+            usize::from(self.bits / 8)
+        } else {
+            0
+        }
+    }
+}
+
+/// Reverse every `width`-byte group of `data` in place (big-endian
+/// samples → little-endian). A trailing partial group is left as-is.
+fn swap_sample_bytes(data: &mut [u8], width: usize) {
+    if width < 2 {
+        return;
+    }
+    for group in data.chunks_exact_mut(width) {
+        group.reverse();
+    }
 }
 
 /// What we extract from an esds box: the DecoderSpecificInfo (empty when
@@ -10131,17 +10518,16 @@ fn parse_traf(
     // it without the matching scheme box, but there's nothing the
     // demuxer can do with it without an IV-size key.
     let mut standard_senc_recorded = false;
-    if let Some(body) = senc_body {
-        if let Some(tenc) = &track.tenc {
-            if let Ok(senc) = parse_senc(&body, tenc.default_per_sample_iv_size) {
-                senc_records.push(SencRecord {
-                    track_idx: state.track_idx as u32,
-                    moof_sequence,
-                    senc,
-                });
-                standard_senc_recorded = true;
-            }
-        }
+    if let Some(body) = senc_body
+        && let Some(tenc) = &track.tenc
+        && let Ok(senc) = parse_senc(&body, tenc.default_per_sample_iv_size)
+    {
+        senc_records.push(SencRecord {
+            track_idx: state.track_idx as u32,
+            moof_sequence,
+            senc,
+        });
+        standard_senc_recorded = true;
     }
 
     // PIFF legacy `uuid` SampleEncryptionBox. The IV width resolves
@@ -10785,7 +11171,7 @@ fn parse_pdin(body: &[u8]) -> Result<PdinRecord> {
     // version = 0 and flags = 0; we tolerate anything the producer
     // wrote because the payload layout is unambiguous.
     let payload = &body[4..];
-    if payload.len() % 8 != 0 {
+    if !payload.len().is_multiple_of(8) {
         return Err(Error::invalid(
             "MP4: pdin payload not a multiple of 8 bytes (rate + initial_delay pairs)",
         ));
@@ -11576,7 +11962,10 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             let ctx = build_ctx(&tag, t);
             resolved = codecs.resolve_tag(&ctx);
         }
-        resolved.unwrap_or_else(|| match t.esds_oti {
+        // Uncompressed audio: the sample entry pins the layout (the
+        // demuxer delivers it little-endian), whatever the FourCC.
+        let pcm = t.pcm.and_then(|l| l.codec_id()).map(CodecId::new);
+        pcm.or(resolved).unwrap_or_else(|| match t.esds_oti {
             Some(oti) => from_sample_entry_with_oti(&t.codec_id_fourcc, oti),
             None => from_sample_entry(&t.codec_id_fourcc),
         })
@@ -11599,11 +11988,40 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         ("flac", Some(24)) => Some(SampleFormat::S24),
         ("flac", Some(32)) => Some(SampleFormat::S32),
         ("pcm_s16le", _) => Some(SampleFormat::S16),
-        _ => None,
+        _ => t.pcm.and_then(|l| l.sample_format()),
     };
     params.width = t.width;
     params.height = t.height;
     params.extradata = t.extradata.clone();
+    // HE-AAC: some writers put the AAC *core* rate in the `mp4a` sample
+    // entry. The decoder emits the SBR output rate the ASC declares, so
+    // report that (ISO/IEC 14496-3 §1.6.5 / §4.6.18).
+    if params.codec_id.as_str() == "aac"
+        && let Some(r) = crate::aac::asc_rates(&params.extradata)
+        && let (Some(out), Some(entry)) = (r.sbr_rate, params.sample_rate)
+        && entry == r.core_rate
+        && out != entry
+    {
+        params.sample_rate = Some(out);
+    }
+    // The decoded-picture layout, from the avcC / hvcC record, so
+    // consumers can plan pixel-format conversions before decoding.
+    if params.media_type == MediaType::Video && params.pixel_format.is_none() {
+        params.pixel_format =
+            video_config::pixel_format_from_config(params.codec_id.as_str(), &params.extradata);
+    }
+    // The picture size the decoder emits: the SPS's cropping window
+    // wins over a sample entry that declares the coded
+    // (macroblock-aligned) size, e.g. 1920x1088 for a 1080p stream.
+    if params.media_type == MediaType::Video
+        && let Some((w, h)) = video_config::cropped_dimensions_from_config(
+            params.codec_id.as_str(),
+            &params.extradata,
+        )
+    {
+        params.width = Some(w);
+        params.height = Some(h);
+    }
 
     // ISO/IEC 14496-12 §8.12: when the track's sample entry was wrapped
     // as `enc*`, surface the recovered scheme type so callers can
@@ -11916,6 +12334,30 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             let _ = write!(s, " stsg={groups}");
         }
         params.options.insert(format!("subtrack_{n}"), s);
+    }
+
+    // ISO/IEC 14496-12 §8.3.2 / §8.4.2: the track's `tkhd` and `mdhd`
+    // creation / modification timestamps, in the boxes' own units
+    // (seconds since 1904-01-01 UTC — *not* the Unix epoch; see
+    // `options::unix_secs_from_mp4_secs`). The two boxes are stamped
+    // separately by some producers (`mdhd` dating the media, `tkhd`
+    // the track), so both pairs are surfaced rather than collapsed.
+    // Each key appears only when its value is non-zero — zero is the
+    // "unset" encoding most files carry. The typed form is
+    // `Mp4Demuxer::tkhd_timestamps` / `::mdhd_timestamps`.
+    for (prefix, ts) in [("tkhd", &t.tkhd_timestamps), ("mdhd", &t.mdhd_timestamps)] {
+        if ts.creation_time != 0 {
+            params.options.insert(
+                format!("{prefix}_creation_time"),
+                ts.creation_time.to_string(),
+            );
+        }
+        if ts.modification_time != 0 {
+            params.options.insert(
+                format!("{prefix}_modification_time"),
+                ts.modification_time.to_string(),
+            );
+        }
     }
 
     // ISO/IEC 14496-12 §8.6.1.4: when the track carries a `cslg`
@@ -12917,6 +13359,10 @@ pub struct Mp4Demuxer {
     /// Total input length in bytes (established at `open`). Used to
     /// reject sample sizes the input cannot back before allocating.
     input_len: u64,
+    /// Per stream: bytes per PCM sample to reverse so big-endian
+    /// uncompressed audio (`twos`, big-endian `ipcm` / `fpcm` / `lpcm`,
+    /// `in24` …) reaches the little-endian PCM codecs; 0 = as stored.
+    pcm_swap: Vec<usize>,
     streams: Vec<StreamInfo>,
     samples: Vec<SampleRef>,
     cursor: usize,
@@ -13103,6 +13549,13 @@ pub struct Mp4Demuxer {
     /// tooling that wants the declared list itself (e.g. a remuxer
     /// carrying the elst across, or a validator).
     edit_lists: Vec<Vec<EditListEntry>>,
+    /// §8.2.2 `mvhd` creation / modification timestamps for the movie.
+    /// See [`Self::mvhd_timestamps`].
+    mvhd_timestamps: HeaderTimestamps,
+    /// Per-stream §8.3.2 `tkhd` timestamps (parallel to `streams`).
+    tkhd_timestamps: Vec<HeaderTimestamps>,
+    /// Per-stream §8.4.2 `mdhd` timestamps (parallel to `streams`).
+    mdhd_timestamps: Vec<HeaderTimestamps>,
     /// `sample_description_index` of the packet most recently returned
     /// by `next_packet` (`None` before the first packet). See
     /// [`Self::sample_description_index_of_last_packet`].
@@ -13548,6 +14001,46 @@ impl Mp4Demuxer {
             .unwrap_or(&[])
     }
 
+    /// The movie-wide §8.2.2 `mvhd` creation / modification
+    /// timestamps, in seconds since 1904-01-01 UTC.
+    ///
+    /// `mvhd` is mandatory, so this always returns a pair; most files
+    /// leave it unstamped, which reads back as the all-zero
+    /// [`HeaderTimestamps::is_unset`] value. The same data appears on
+    /// the flat metadata channel as `mvhd_creation_time` /
+    /// `mvhd_modification_time` (emitted only when non-zero).
+    ///
+    /// This is the read-side dual of
+    /// [`Mp4MuxerOptions::creation_time`](crate::options::Mp4MuxerOptions::creation_time):
+    /// a remuxer preserves a source's stamp by feeding this value
+    /// straight back in — same epoch, same units, no conversion.
+    pub fn mvhd_timestamps(&self) -> HeaderTimestamps {
+        self.mvhd_timestamps
+    }
+
+    /// The §8.3.2 `tkhd` creation / modification timestamps of
+    /// `stream_index`'s track, in seconds since 1904-01-01 UTC.
+    /// `None` when the index names no stream.
+    ///
+    /// Surfaced flat on the stream's `params.options` as
+    /// `tkhd_creation_time` / `tkhd_modification_time` (only when
+    /// non-zero). See [`Self::mdhd_timestamps`] for the `mdhd` pair,
+    /// which a producer may stamp differently.
+    pub fn tkhd_timestamps(&self, stream_index: u32) -> Option<HeaderTimestamps> {
+        self.tkhd_timestamps.get(stream_index as usize).copied()
+    }
+
+    /// The §8.4.2 `mdhd` creation / modification timestamps of
+    /// `stream_index`'s track media, in seconds since 1904-01-01 UTC.
+    /// `None` when the index names no stream.
+    ///
+    /// Surfaced flat on the stream's `params.options` as
+    /// `mdhd_creation_time` / `mdhd_modification_time` (only when
+    /// non-zero).
+    pub fn mdhd_timestamps(&self, stream_index: u32) -> Option<HeaderTimestamps> {
+        self.mdhd_timestamps.get(stream_index as usize).copied()
+    }
+
     /// The 1-based §8.5.2 `sample_description_index` of the packet
     /// most recently returned by `next_packet` (`None` before the
     /// first packet). Resolved from the covering `stsc` entry (§8.7.4)
@@ -13603,6 +14096,9 @@ impl Demuxer for Mp4Demuxer {
         self.input.seek(SeekFrom::Start(s.offset))?;
         let mut data = vec![0u8; s.size as usize];
         self.input.read_exact(&mut data)?;
+        if let Some(&width) = self.pcm_swap.get(s.track_idx as usize) {
+            swap_sample_bytes(&mut data, width);
+        }
         let stream = &self.streams[s.track_idx as usize];
         let mut pkt = Packet::new(s.track_idx, stream.time_base, data);
         // CTS for `pts` (display order), DTS for `dts` (decode order).
@@ -14438,8 +14934,8 @@ pub fn build_stvi_box(record: &StviRecord) -> Result<Vec<u8>> {
     out.extend_from_slice(&((8 + body_len) as u32).to_be_bytes());
     out.extend_from_slice(b"stvi");
     out.extend_from_slice(&[0u8; 4]); // FullBox version 0, flags 0
-                                      // First word: reserved(30) = 0 in the high bits, single_view_allowed
-                                      // in the low 2 bits.
+    // First word: reserved(30) = 0 in the high bits, single_view_allowed
+    // in the low 2 bits.
     out.extend_from_slice(&((record.single_view_allowed as u32) & 0x3).to_be_bytes());
     out.extend_from_slice(&record.stereo_scheme.to_be_bytes());
     out.extend_from_slice(&(length as u32).to_be_bytes());
@@ -14587,7 +15083,7 @@ mod tests {
         out.extend_from_slice(&16u16.to_be_bytes()); // sample_size
         out.extend_from_slice(&[0u8; 4]); // pre_defined + reserved
         out.extend_from_slice(&((48_000u32) << 16).to_be_bytes()); // sample_rate 16.16
-                                                                   // Child box: 4-byte size + 4-byte fourcc + body.
+        // Child box: 4-byte size + 4-byte fourcc + body.
         let total = (8 + child_body.len()) as u32;
         out.extend_from_slice(&total.to_be_bytes());
         out.extend_from_slice(child_fourcc);
@@ -14602,9 +15098,13 @@ mod tests {
             codec_id_fourcc: [0; 4],
             timescale: 0,
             duration: None,
+            tkhd_timestamps: super::HeaderTimestamps::default(),
+            mdhd_timestamps: super::HeaderTimestamps::default(),
             channels: None,
             sample_rate: None,
             sample_size_bits: None,
+            stsd_version: 0,
+            pcm: None,
             width: None,
             height: None,
             extradata: Vec::new(),
@@ -14739,7 +15239,7 @@ mod tests {
         entry_body.extend_from_slice(&[0u8; 32]); // compressorname
         entry_body.extend_from_slice(&0x0018u16.to_be_bytes()); // depth
         entry_body.extend_from_slice(&(-1i16).to_be_bytes()); // pre_defined
-                                                              // Total preamble: 78 bytes.
+        // Total preamble: 78 bytes.
         assert_eq!(entry_body.len(), 78);
 
         let mut sinf_body = Vec::new();
@@ -16271,14 +16771,14 @@ mod tests {
         mdhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
         mdhd.extend_from_slice(&0u32.to_be_bytes()); // duration
         mdhd.extend_from_slice(&[0u8; 4]); // language + pre_defined
-                                           // Minimal hdlr identifying a video track.
+        // Minimal hdlr identifying a video track.
         let mut hdlr = Vec::new();
         hdlr.extend_from_slice(&[0u8; 4]); // FullBox
         hdlr.extend_from_slice(&[0u8; 4]); // pre_defined
         hdlr.extend_from_slice(b"vide"); // handler_type
         hdlr.extend_from_slice(&[0u8; 12]); // reserved
         hdlr.push(0); // name (empty C string)
-                      // Wrap the mdhd + hdlr into a minimal mdia.
+        // Wrap the mdhd + hdlr into a minimal mdia.
         let mut mdia = Vec::new();
         mdia.extend(wrap_box_full_size(b"mdhd", &mdhd));
         mdia.extend(wrap_box_full_size(b"hdlr", &hdlr));
@@ -16557,14 +17057,14 @@ mod tests {
         mdhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
         mdhd.extend_from_slice(&0u32.to_be_bytes()); // duration
         mdhd.extend_from_slice(&[0u8; 4]); // language + pre_defined
-                                           // Minimal hdlr identifying a video track.
+        // Minimal hdlr identifying a video track.
         let mut hdlr = Vec::new();
         hdlr.extend_from_slice(&[0u8; 4]); // FullBox
         hdlr.extend_from_slice(&[0u8; 4]); // pre_defined
         hdlr.extend_from_slice(b"vide"); // handler_type
         hdlr.extend_from_slice(&[0u8; 12]); // reserved
         hdlr.push(0); // name (empty C string)
-                      // Wrap mdhd + hdlr into a minimal mdia.
+        // Wrap mdhd + hdlr into a minimal mdia.
         let mut mdia = Vec::new();
         mdia.extend(wrap_box_full_size(b"mdhd", &mdhd));
         mdia.extend(wrap_box_full_size(b"hdlr", &hdlr));
@@ -17766,6 +18266,38 @@ mod tests {
         let boxed = super::build_tcmi_box(&tc);
         let back = super::parse_tcmi_box(&boxed[8..]).expect("round-trip parse");
         assert_eq!(back, tc);
+    }
+
+    /// Regression (r443 box_parsers fuzz): a `font_name` longer than the
+    /// 255-byte Pascal ceiling — which arises when the parser lossily
+    /// replaces non-UTF-8 wire bytes (each expands to a 3-byte U+FFFD) —
+    /// must truncate at a char boundary so the rebuilt box reparses
+    /// cleanly to a prefix, never a body whose declared length slices a
+    /// multi-byte char (which grew a replacement-character tail).
+    #[test]
+    fn build_tcmi_box_truncates_overlong_name_on_char_boundary() {
+        // 100 replacement chars = 300 bytes > 255; the 255-byte cut
+        // lands mid-char (each U+FFFD is 3 bytes; 255 = 85*3, a clean
+        // boundary — so use 86 chars * 3 = 258 and force an 85.33 cut).
+        let name: String = "\u{FFFD}".repeat(90);
+        let tc = super::TcmiBox {
+            text_font: 1,
+            text_face: 2,
+            text_size: 3,
+            text_color: [1, 2, 3],
+            background_color: [4, 5, 6],
+            font_name: name.clone(),
+        };
+        let boxed = super::build_tcmi_box(&tc);
+        let back = super::parse_tcmi_box(&boxed[8..]).expect("reparse after truncating build");
+        // Emitted name is a valid-UTF-8 prefix of the original, ≤ 255 B.
+        assert!(back.font_name.len() <= 255);
+        assert!(name.starts_with(&back.font_name));
+        assert_eq!(back.font_name.len() % 3, 0, "cut on a U+FFFD boundary");
+        // Idempotent: rebuilding the (now representable) record is exact.
+        let boxed2 = super::build_tcmi_box(&back);
+        let back2 = super::parse_tcmi_box(&boxed2[8..]).unwrap();
+        assert_eq!(back2, back);
     }
 
     /// A `tcmi` body shorter than the fixed 22-byte prefix is rejected;
@@ -19501,7 +20033,7 @@ mod tests {
         body.extend_from_slice(&[0u8, 0, 0, 0x2A]); // version 0 + flags
         body.extend_from_slice(b"roll"); // grouping_type
         body.extend_from_slice(&2u32.to_be_bytes()); // pattern_count = 2
-                                                     // pattern 1: length 1, sample_count 3
+        // pattern 1: length 1, sample_count 3
         body.extend_from_slice(&1u16.to_be_bytes());
         body.extend_from_slice(&3u16.to_be_bytes());
         // pattern 2: length 2, sample_count 1
@@ -19532,9 +20064,9 @@ mod tests {
         body.extend_from_slice(&[0u8, 0, 0, 0]); // version 0 + flags 0
         body.extend_from_slice(b"sync"); // grouping_type
         body.extend_from_slice(&1u32.to_be_bytes()); // pattern_count = 1
-                                                     // pattern_length=3 (0b0011), sample_count=2 (0b0010) → 0x32
-                                                     // indices [1, 2, 4] → 0b0001 0010 0100 = 0x12 0x4_ (12 bits,
-                                                     // padded to a byte boundary by the box's size).
+        // pattern_length=3 (0b0011), sample_count=2 (0b0010) → 0x32
+        // indices [1, 2, 4] → 0b0001 0010 0100 = 0x12 0x4_ (12 bits,
+        // padded to a byte boundary by the box's size).
         body.push(0x32);
         body.push(0x12);
         body.push(0x40); // top nibble = index 4, low nibble padding
@@ -20315,8 +20847,8 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&[0u8; 4]);
         body.extend_from_slice(&2u32.to_be_bytes()); // sample_count = 2
-                                                     // pad1 = 5 (0b101) with reserved bit set: nibble = 0b1101 = 0xD
-                                                     // pad2 = 2 (0b010) with reserved bit set: nibble = 0b1010 = 0xA
+        // pad1 = 5 (0b101) with reserved bit set: nibble = 0b1101 = 0xD
+        // pad2 = 2 (0b010) with reserved bit set: nibble = 0b1010 = 0xA
         body.push(0xDA);
         let v = super::parse_padb(&body).unwrap();
         assert_eq!(v, vec![5u8, 2]);
@@ -20619,7 +21151,7 @@ mod tests {
     fn parse_pdin_big_endian_byte_order() {
         let mut body = Vec::new();
         body.extend_from_slice(&[0u8; 4]); // preamble
-                                           // rate = 0x01_02_03_04, initial_delay = 0x05_06_07_08 in big-endian.
+        // rate = 0x01_02_03_04, initial_delay = 0x05_06_07_08 in big-endian.
         body.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
         body.extend_from_slice(&[0x05, 0x06, 0x07, 0x08]);
         let r = super::parse_pdin(&body).unwrap();
@@ -20814,7 +21346,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&[0u8; 4]); // preamble
         body.push(1); // level_count = 1
-                      // Only 4 bytes of the 5-byte header (track_id but no packed byte).
+        // Only 4 bytes of the 5-byte header (track_id but no packed byte).
         body.extend_from_slice(&[0u8; 4]);
         assert!(super::parse_leva(&body).is_err());
     }
@@ -20828,7 +21360,7 @@ mod tests {
         body.push(1); // level_count
         body.extend_from_slice(&5u32.to_be_bytes()); // track_id
         body.push(0); // padding=0 | at=0
-                      // Only 3 of 4 grouping_type bytes.
+        // Only 3 of 4 grouping_type bytes.
         body.extend_from_slice(&[0u8; 3]);
         assert!(super::parse_leva(&body).is_err());
     }
@@ -20843,7 +21375,7 @@ mod tests {
         body.extend_from_slice(&5u32.to_be_bytes()); // track_id
         body.push(1); // padding=0 | at=1
         body.extend_from_slice(&7u32.to_be_bytes()); // grouping_type
-                                                     // Missing the 4-byte grouping_type_parameter.
+        // Missing the 4-byte grouping_type_parameter.
         assert!(super::parse_leva(&body).is_err());
     }
 
@@ -20869,7 +21401,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&[0u8; 4]); // preamble
         body.push(2); // level_count = 2
-                      // Entry 0: track_id = 9, padding = 1, at = 5 (reserved).
+        // Entry 0: track_id = 9, padding = 1, at = 5 (reserved).
         body.extend_from_slice(&9u32.to_be_bytes());
         body.push(0x80 | 5);
         // Entry 1: track_id = 10, padding = 0, at = 2 (no tail).
@@ -21238,32 +21770,38 @@ mod tests {
     #[test]
     fn assp_build_rejects_invalid_records() {
         // v0 entry carrying a grouping_type_parameter (no v0 wire slot)
-        assert!(super::build_assp_box(&super::AsspRecord {
-            version: 0,
-            entries: vec![super::AsspEntry {
-                grouping_type_parameter: Some(1),
-                min_initial_alt_startup_offset: 0,
-            }],
-        })
-        .is_err());
-        // v0 with two entries
-        assert!(super::build_assp_box(&super::AsspRecord {
-            version: 0,
-            entries: vec![
-                super::AsspEntry {
-                    grouping_type_parameter: None,
+        assert!(
+            super::build_assp_box(&super::AsspRecord {
+                version: 0,
+                entries: vec![super::AsspEntry {
+                    grouping_type_parameter: Some(1),
                     min_initial_alt_startup_offset: 0,
-                };
-                2
-            ],
-        })
-        .is_err());
+                }],
+            })
+            .is_err()
+        );
+        // v0 with two entries
+        assert!(
+            super::build_assp_box(&super::AsspRecord {
+                version: 0,
+                entries: vec![
+                    super::AsspEntry {
+                        grouping_type_parameter: None,
+                        min_initial_alt_startup_offset: 0,
+                    };
+                    2
+                ],
+            })
+            .is_err()
+        );
         // unsupported version
-        assert!(super::build_assp_box(&super::AsspRecord {
-            version: 9,
-            entries: vec![],
-        })
-        .is_err());
+        assert!(
+            super::build_assp_box(&super::AsspRecord {
+                version: 9,
+                entries: vec![],
+            })
+            .is_err()
+        );
     }
 
     /// When an `assp` child of a `trep` decodes cleanly, the `TrepChild`
@@ -21333,31 +21871,35 @@ mod tests {
     #[test]
     fn build_trep_box_rejects_inconsistent_children() {
         // assp record under a non-assp fourcc
-        assert!(super::build_trep_box(&super::TrepRecord {
-            track_id: 1,
-            children: vec![super::TrepChild {
-                fourcc: *b"abcd",
-                payload_len: 0,
-                assp: Some(super::AsspRecord {
-                    version: 0,
-                    entries: vec![super::AsspEntry {
-                        grouping_type_parameter: None,
-                        min_initial_alt_startup_offset: 0,
-                    }],
-                }),
-            }],
-        })
-        .is_err());
+        assert!(
+            super::build_trep_box(&super::TrepRecord {
+                track_id: 1,
+                children: vec![super::TrepChild {
+                    fourcc: *b"abcd",
+                    payload_len: 0,
+                    assp: Some(super::AsspRecord {
+                        version: 0,
+                        entries: vec![super::AsspEntry {
+                            grouping_type_parameter: None,
+                            min_initial_alt_startup_offset: 0,
+                        }],
+                    }),
+                }],
+            })
+            .is_err()
+        );
         // opaque child with non-zero payload_len
-        assert!(super::build_trep_box(&super::TrepRecord {
-            track_id: 1,
-            children: vec![super::TrepChild {
-                fourcc: *b"abcd",
-                payload_len: 4,
-                assp: None,
-            }],
-        })
-        .is_err());
+        assert!(
+            super::build_trep_box(&super::TrepRecord {
+                track_id: 1,
+                children: vec![super::TrepChild {
+                    fourcc: *b"abcd",
+                    payload_len: 4,
+                    assp: None,
+                }],
+            })
+            .is_err()
+        );
     }
 
     /// `parse_ssix_box` (the public wrapper) routes through the same
@@ -21694,10 +22236,12 @@ mod tests {
     #[test]
     fn build_subs_box_empty_and_degenerate() {
         let empty = super::build_subs_box(&super::SubsBox::default()).unwrap();
-        assert!(super::parse_subs_box(&empty[8..])
-            .unwrap()
-            .entries
-            .is_empty());
+        assert!(
+            super::parse_subs_box(&empty[8..])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         let degenerate = super::SubsBox {
             version: 0,
             flags: 0,
@@ -22833,7 +23377,7 @@ mod tests {
         b.extend_from_slice(&1u16.to_be_bytes()); // item_count
         b.extend_from_slice(&1u16.to_be_bytes()); // item_ID
         b.extend_from_slice(&0u16.to_be_bytes()); // data_reference_index
-                                                  // base_offset omitted (size 0)
+        // base_offset omitted (size 0)
         b.extend_from_slice(&1u16.to_be_bytes()); // extent_count
         b.extend_from_slice(&0x1000u32.to_be_bytes()); // extent_offset
         b.extend_from_slice(&0x40u32.to_be_bytes()); // extent_length
@@ -23119,9 +23663,10 @@ mod tests {
         // The flat metadata surface carries the partition count.
         let mut kv = Vec::new();
         super::surface_meta_items(&mi, &mut kv);
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "meta_fiin_partitions" && v == "1"));
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "meta_fiin_partitions" && v == "1")
+        );
     }
 
     #[test]

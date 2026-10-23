@@ -39,10 +39,10 @@ use crate::options::{
     BrandPreset, FragmentedOptions, Mp4MuxerOptions, TrackEditList, TrackSampleGroups,
 };
 use crate::sample_entries::{
-    apply_protection, sample_entry_for, subtitle_handler_for, subtitle_uses_sthd, SampleEntry,
+    SampleEntry, apply_protection, sample_entry_for, subtitle_handler_for, subtitle_uses_sthd,
 };
 use crate::sample_groups::{
-    build_csgp, build_sbgp, build_sgpd, CompactSampleToGroup, SampleGroupDescription, SampleToGroup,
+    CompactSampleToGroup, SampleGroupDescription, SampleToGroup, build_csgp, build_sbgp, build_sgpd,
 };
 
 /// Per-track state kept between `write_packet` calls.
@@ -85,6 +85,25 @@ pub(crate) struct TrackState {
     pub(crate) prev_pts_in_ts: Option<i64>,
     /// First PTS in media time scale (for duration calculation + elst).
     pub(crate) first_pts_in_ts: Option<i64>,
+    /// End of the presented range (`pts + duration` of the latest
+    /// packet) in media time scale — the edit-list segment end when the
+    /// track starts with pre-roll (negative first PTS).
+    pub(crate) presentation_end_in_ts: Option<i64>,
+    /// AAC track whose `esds` AudioSpecificConfig was synthesised from
+    /// the stream geometry: the first ADTS header (if packets arrive as
+    /// ADTS) replaces it with the exact configuration.
+    pub(crate) aac_asc_synthesised: bool,
+
+    /// Header timestamps for this track's `tkhd` (§8.3.2), in seconds
+    /// since 1904-01-01 UTC. Resolved at `open` from
+    /// `Mp4MuxerOptions::creation_time` / `modification_time` plus any
+    /// `track_header_timestamps` override, which replaces the pair
+    /// outright; the all-zero pair means "unset" (the default).
+    pub(crate) tkhd_timestamps: crate::demux::HeaderTimestamps,
+    /// Header timestamps for this track's `mdhd` (§8.4.2). Same
+    /// resolution, but a `TrackHeaderTimestamps::media` override can date
+    /// the media apart from the track that carries it.
+    pub(crate) mdhd_timestamps: crate::demux::HeaderTimestamps,
 }
 
 impl TrackState {
@@ -113,6 +132,10 @@ impl TrackState {
             cumulative_duration: 0,
             prev_pts_in_ts: None,
             first_pts_in_ts: None,
+            presentation_end_in_ts: None,
+            aac_asc_synthesised: false,
+            tkhd_timestamps: crate::demux::HeaderTimestamps::default(),
+            mdhd_timestamps: crate::demux::HeaderTimestamps::default(),
         }
     }
 
@@ -193,10 +216,26 @@ pub fn open_with_options(
         ));
     }
     if let Some(frag_opts) = options.fragmented.clone() {
+        // The fragmented path runs its own copy of the checks below
+        // (`open_fragmented_typed` is a public entry point in its own
+        // right), so validate once per path rather than twice here.
         return crate::frag::open_fragmented(output, streams, options, frag_opts);
     }
+    options.validate_track_header_timestamps(streams.len())?;
     let mut tracks = Vec::with_capacity(streams.len());
     for (i, s) in streams.iter().enumerate() {
+        // AAC without extradata: synthesise the AudioSpecificConfig the
+        // `esds` needs (refined from the first ADTS header, if any, at
+        // write_packet time).
+        let synth = crate::aac::with_asc(&s.params)?;
+        let asc_synthesised = synth.is_some();
+        let s = &match synth {
+            Some(params) => StreamInfo {
+                params,
+                ..s.clone()
+            },
+            None => s.clone(),
+        };
         let mut entry = sample_entry_for(&s.params)?;
         // ISO/IEC 14496-12 §8.12: wrap the entry into its protected
         // enc* form when a protection directive targets this stream.
@@ -207,7 +246,14 @@ pub fn open_with_options(
         {
             entry = apply_protection(entry, s.params.media_type, prot)?;
         }
-        tracks.push(TrackState::new(s.clone(), entry));
+        let mut track = TrackState::new(s.clone(), entry);
+        track.aac_asc_synthesised =
+            asc_synthesised && !options.track_protection.iter().any(|p| p.stream_index == i);
+        // §8.3.2 / §8.4.2 header timestamps: movie-wide value unless a
+        // per-track override targets this stream.
+        track.tkhd_timestamps = options.resolve_track_timestamps(i);
+        track.mdhd_timestamps = options.resolve_media_timestamps(i);
+        tracks.push(track);
     }
     // ISO/IEC 14496-12 §8.6.6: validate explicit edit lists up front so
     // a list that would not round-trip (§8.6.6.3 rate / final-empty-edit
@@ -353,16 +399,33 @@ impl Muxer for Mp4Muxer {
             )));
         }
 
+        // AAC: an MP4 sample is one bare access unit (ISO/IEC 14496-14
+        // §3.1.2) — drop any ADTS transport header.
+        let is_aac = self.tracks[idx].stream.params.codec_id.as_str() == "aac";
+        let data: std::borrow::Cow<'_, [u8]> = if is_aac {
+            if self.tracks[idx].aac_asc_synthesised {
+                if let Some(info) = crate::aac::parse_adts(&packet.data) {
+                    let t = &mut self.tracks[idx];
+                    t.stream.params.extradata = crate::aac::asc_from_adts(&info);
+                    t.sample_entry = sample_entry_for(&t.stream.params)?;
+                }
+                self.tracks[idx].aac_asc_synthesised = false;
+            }
+            crate::aac::strip_adts(&packet.data)?
+        } else {
+            std::borrow::Cow::Borrowed(&packet.data[..])
+        };
+
         // Bytes first: capture offset, append payload, update mdat counter.
         // `cur_offset` is absolute in direct-write mode and relative-to-mdat
         // in faststart mode (patched up at trailer time).
         let cur_offset = self.mdat_start_offset + self.mdat_bytes;
         if let Some(buf) = self.mdat_buffer.as_mut() {
-            buf.get_mut().extend_from_slice(&packet.data);
+            buf.get_mut().extend_from_slice(&data);
         } else {
-            self.output.write_all(&packet.data)?;
+            self.output.write_all(&data)?;
         }
-        self.mdat_bytes += packet.data.len() as u64;
+        self.mdat_bytes += data.len() as u64;
 
         // Now update bookkeeping on the track (released borrow above).
         let t = &mut self.tracks[idx];
@@ -375,7 +438,7 @@ impl Muxer for Mp4Muxer {
         // fall back to packet.duration rescaled.
         let delta = compute_delta(t, packet, pts_in_ts);
 
-        t.sample_sizes.push(packet.data.len() as u32);
+        t.sample_sizes.push(data.len() as u32);
         // stts RLE: append a new (1, delta) or extend the last run.
         match t.stts.last_mut() {
             Some((count, d)) if *d == delta => *count += 1,
@@ -402,6 +465,8 @@ impl Muxer for Mp4Muxer {
                 t.first_pts_in_ts = Some(p);
             }
             t.prev_pts_in_ts = Some(p);
+            let end = p + i64::from(delta);
+            t.presentation_end_in_ts = Some(t.presentation_end_in_ts.map_or(end, |e| e.max(end)));
         } else {
             // Without pts, accumulate via deltas.
             let base = t.prev_pts_in_ts.unwrap_or(0);
@@ -473,6 +538,7 @@ impl Mp4Muxer {
             &self.options.track_edit_lists,
             &self.options.track_sample_groups,
             &self.options.pssh,
+            self.options.resolve_movie_timestamps(),
         )?;
         self.output.write_all(&moov)?;
         Ok(())
@@ -530,6 +596,7 @@ impl Mp4Muxer {
                 &self.options.track_edit_lists,
                 &self.options.track_sample_groups,
                 &self.options.pssh,
+                self.options.resolve_movie_timestamps(),
             )?;
             let candidate_size = candidate.len() as u64;
             let converged = candidate_size == moov_size;
@@ -573,6 +640,7 @@ fn build_moov(
     track_edit_lists: &[TrackEditList],
     track_sample_groups: &[TrackSampleGroups],
     pssh: &[crate::cenc::PsshBox],
+    movie_times: crate::demux::HeaderTimestamps,
 ) -> Result<Vec<u8>> {
     // mvhd: use the largest media-time-scale duration as a rough movie
     // duration at timescale 1000.
@@ -591,7 +659,12 @@ fn build_moov(
     let next_track_id = (tracks.len() as u32) + 1;
 
     let mut moov_body = Vec::new();
-    moov_body.extend_from_slice(&build_mvhd(movie_timescale, movie_duration, next_track_id));
+    moov_body.extend_from_slice(&build_mvhd(
+        movie_timescale,
+        movie_duration,
+        next_track_id,
+        movie_times,
+    ));
     for (i, t) in tracks.iter().enumerate() {
         // Gather all sample-group directives that target this stream index.
         // Multiple directives for the same stream accumulate in encounter
@@ -629,22 +702,37 @@ fn build_moov(
     Ok(wrap_box(b"moov", &moov_body))
 }
 
-pub(crate) fn build_mvhd(timescale: u32, duration: u64, next_track_id: u32) -> Vec<u8> {
-    // Choose version 0 if duration fits in u32, else version 1.
-    let use_v1 = duration > u32::MAX as u64;
+/// `true` when either half of a header-timestamp pair overflows the
+/// version-0 32-bit field, i.e. the box must be written as version 1.
+/// Shared by all three header builders so they promote alike.
+fn needs_64_bit_time(times: crate::demux::HeaderTimestamps) -> bool {
+    times.creation_time > u32::MAX as u64 || times.modification_time > u32::MAX as u64
+}
+
+pub(crate) fn build_mvhd(
+    timescale: u32,
+    duration: u64,
+    next_track_id: u32,
+    times: crate::demux::HeaderTimestamps,
+) -> Vec<u8> {
+    // Choose version 0 if every 32-bit field fits, else version 1. The
+    // §8.2.2 v0 layout carries duration *and* both timestamps as u32,
+    // so a post-2040 timestamp forces the promotion just as a
+    // >u32::MAX duration does.
+    let use_v1 = duration > u32::MAX as u64 || needs_64_bit_time(times);
     let mut body = Vec::with_capacity(120);
     if use_v1 {
         body.push(1); // version
         body.extend_from_slice(&[0, 0, 0]); // flags
-        body.extend_from_slice(&0u64.to_be_bytes()); // creation_time
-        body.extend_from_slice(&0u64.to_be_bytes()); // modification_time
+        body.extend_from_slice(&times.creation_time.to_be_bytes());
+        body.extend_from_slice(&times.modification_time.to_be_bytes());
         body.extend_from_slice(&timescale.to_be_bytes());
         body.extend_from_slice(&duration.to_be_bytes());
     } else {
         body.push(0); // version
         body.extend_from_slice(&[0, 0, 0]); // flags
-        body.extend_from_slice(&0u32.to_be_bytes()); // creation_time
-        body.extend_from_slice(&0u32.to_be_bytes()); // modification_time
+        body.extend_from_slice(&(times.creation_time as u32).to_be_bytes());
+        body.extend_from_slice(&(times.modification_time as u32).to_be_bytes());
         body.extend_from_slice(&timescale.to_be_bytes());
         body.extend_from_slice(&(duration as u32).to_be_bytes());
     }
@@ -653,7 +741,7 @@ pub(crate) fn build_mvhd(timescale: u32, duration: u64, next_track_id: u32) -> V
     body.extend_from_slice(&0x0100u16.to_be_bytes()); // volume
     body.extend_from_slice(&[0, 0]); // reserved u16
     body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // reserved 2x u32
-                                                       // identity matrix (9 × 32-bit fixed-point, 3x3)
+    // identity matrix (9 × 32-bit fixed-point, 3x3)
     let identity: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
     for v in identity {
         body.extend_from_slice(&v.to_be_bytes());
@@ -678,7 +766,12 @@ fn build_trak(
     let mut body = Vec::new();
     let track_duration_movie =
         rescale_u64(t.cumulative_duration, t.media_time_scale, movie_timescale);
-    body.extend_from_slice(&build_tkhd(track_id, track_duration_movie, &t.stream));
+    body.extend_from_slice(&build_tkhd(
+        track_id,
+        track_duration_movie,
+        &t.stream,
+        t.tkhd_timestamps,
+    ));
     // edts/elst (ISO/IEC 14496-12 §8.6.5–6) goes between tkhd and mdia. An
     // explicit caller-supplied list is emitted verbatim (and regardless of
     // `write_edit_list` — the flag governs only the automatic start-delay
@@ -687,10 +780,10 @@ fn build_trak(
     if let Some(entries) = explicit_elst {
         let elst = crate::demux::build_elst_box(entries)?;
         body.extend_from_slice(&wrap_box(b"edts", &elst));
-    } else if write_edit_list {
-        if let Some(edts) = build_edts(t, movie_timescale, track_duration_movie) {
-            body.extend_from_slice(&edts);
-        }
+    } else if write_edit_list
+        && let Some(edts) = build_edts(t, movie_timescale, track_duration_movie)
+    {
+        body.extend_from_slice(&edts);
     }
     body.extend_from_slice(&build_mdia_with_sample_groups(t, sbgp, sgpd, csgp)?);
     Ok(wrap_box(b"trak", &body))
@@ -716,7 +809,10 @@ fn build_trak(
 /// duration exceeds the 32-bit range, else version 0.
 fn build_edts(t: &TrackState, movie_timescale: u32, track_duration_movie: u64) -> Option<Vec<u8>> {
     let first_pts = t.first_pts_in_ts?;
-    if first_pts <= 0 {
+    if first_pts < 0 {
+        return build_preroll_edts(t, first_pts, movie_timescale);
+    }
+    if first_pts == 0 {
         return None;
     }
     // Start delay in the movie timescale (elst segment_duration units).
@@ -743,6 +839,32 @@ fn build_edts(t: &TrackState, movie_timescale: u32, track_duration_movie: u64) -
     Some(wrap_box(b"edts", &elst))
 }
 
+/// Build the `edts/elst` for a track whose first sample is decode
+/// pre-roll — it carries a **negative** PTS, e.g. the AAC encoder-delay
+/// ("priming") access unit whose output is never presented.
+///
+/// The first sample sits at media composition time 0, so presentation
+/// time 0 is media time `-first_pts`. One normal edit (§8.6.6.3) starts
+/// there (`media_time = -first_pts`) and runs to the end of the
+/// presented range (`max(pts + duration)`), which also trims any
+/// trailing padding a shortened final packet duration declares. This is
+/// exactly the mapping the demuxer's edit-list timeline inverts back
+/// into negative, `discard`-flagged pre-roll timestamps.
+fn build_preroll_edts(t: &TrackState, first_pts: i64, movie_timescale: u32) -> Option<Vec<u8>> {
+    let media_time = first_pts.checked_neg()?;
+    let end = t.presentation_end_in_ts.unwrap_or(0).max(0);
+    let seg_movie = rescale_u64(end as u64, t.media_time_scale, movie_timescale);
+    let use_v1 = seg_movie > u32::MAX as u64 || media_time > i64::from(i32::MAX);
+    let media_rate: u32 = 0x0001_0000;
+    let mut body = Vec::new();
+    body.push(if use_v1 { 1 } else { 0 });
+    body.extend_from_slice(&[0, 0, 0]);
+    body.extend_from_slice(&1u32.to_be_bytes());
+    push_elst_entry(&mut body, use_v1, seg_movie, media_time, media_rate);
+    let elst = wrap_box(b"elst", &body);
+    Some(wrap_box(b"edts", &elst))
+}
+
 /// Append one EditListBox entry (`segment_duration`, `media_time`,
 /// `media_rate`) using v0 (32-bit) or v1 (64-bit) field widths per §8.6.6.2.
 fn push_elst_entry(
@@ -762,23 +884,30 @@ fn push_elst_entry(
     out.extend_from_slice(&media_rate.to_be_bytes());
 }
 
-pub(crate) fn build_tkhd(track_id: u32, duration: u64, stream: &StreamInfo) -> Vec<u8> {
-    let use_v1 = duration > u32::MAX as u64;
+pub(crate) fn build_tkhd(
+    track_id: u32,
+    duration: u64,
+    stream: &StreamInfo,
+    times: crate::demux::HeaderTimestamps,
+) -> Vec<u8> {
+    // §8.3.2: as in mvhd, the v0 layout is u32 for duration and both
+    // timestamps — any of them overflowing promotes the box to v1.
+    let use_v1 = duration > u32::MAX as u64 || needs_64_bit_time(times);
     let mut body = Vec::new();
     let flags: u32 = 0x0000_0007; // track_enabled | track_in_movie | track_in_preview
     if use_v1 {
         body.push(1);
         body.extend_from_slice(&flags.to_be_bytes()[1..4]);
-        body.extend_from_slice(&0u64.to_be_bytes()); // creation_time
-        body.extend_from_slice(&0u64.to_be_bytes()); // modification_time
+        body.extend_from_slice(&times.creation_time.to_be_bytes());
+        body.extend_from_slice(&times.modification_time.to_be_bytes());
         body.extend_from_slice(&track_id.to_be_bytes());
         body.extend_from_slice(&0u32.to_be_bytes()); // reserved
         body.extend_from_slice(&duration.to_be_bytes());
     } else {
         body.push(0);
         body.extend_from_slice(&flags.to_be_bytes()[1..4]);
-        body.extend_from_slice(&0u32.to_be_bytes()); // creation_time
-        body.extend_from_slice(&0u32.to_be_bytes()); // modification_time
+        body.extend_from_slice(&(times.creation_time as u32).to_be_bytes());
+        body.extend_from_slice(&(times.modification_time as u32).to_be_bytes());
         body.extend_from_slice(&track_id.to_be_bytes());
         body.extend_from_slice(&0u32.to_be_bytes()); // reserved
         body.extend_from_slice(&(duration as u32).to_be_bytes());
@@ -786,7 +915,7 @@ pub(crate) fn build_tkhd(track_id: u32, duration: u64, stream: &StreamInfo) -> V
     body.extend_from_slice(&[0u8; 8]); // reserved 2x u32
     body.extend_from_slice(&0i16.to_be_bytes()); // layer
     body.extend_from_slice(&0i16.to_be_bytes()); // alternate_group
-                                                 // volume: 1.0 for audio, 0 for non-audio
+    // volume: 1.0 for audio, 0 for non-audio
     let volume: u16 = if stream.params.media_type == MediaType::Audio {
         0x0100
     } else {
@@ -794,7 +923,7 @@ pub(crate) fn build_tkhd(track_id: u32, duration: u64, stream: &StreamInfo) -> V
     };
     body.extend_from_slice(&volume.to_be_bytes());
     body.extend_from_slice(&[0, 0]); // reserved u16
-                                     // identity matrix
+    // identity matrix
     let identity: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
     for v in identity {
         body.extend_from_slice(&v.to_be_bytes());
@@ -831,20 +960,22 @@ fn build_mdia_with_sample_groups(
 
 fn build_mdhd(t: &TrackState) -> Vec<u8> {
     let duration = t.cumulative_duration;
-    let use_v1 = duration > u32::MAX as u64;
+    let times = t.mdhd_timestamps;
+    // §8.4.2: same v0/v1 field-width rule as mvhd and tkhd.
+    let use_v1 = duration > u32::MAX as u64 || needs_64_bit_time(times);
     let mut body = Vec::new();
     if use_v1 {
         body.push(1);
         body.extend_from_slice(&[0, 0, 0]); // flags
-        body.extend_from_slice(&0u64.to_be_bytes()); // creation
-        body.extend_from_slice(&0u64.to_be_bytes()); // modification
+        body.extend_from_slice(&times.creation_time.to_be_bytes());
+        body.extend_from_slice(&times.modification_time.to_be_bytes());
         body.extend_from_slice(&t.media_time_scale.to_be_bytes());
         body.extend_from_slice(&duration.to_be_bytes());
     } else {
         body.push(0);
         body.extend_from_slice(&[0, 0, 0]); // flags
-        body.extend_from_slice(&0u32.to_be_bytes());
-        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&(times.creation_time as u32).to_be_bytes());
+        body.extend_from_slice(&(times.modification_time as u32).to_be_bytes());
         body.extend_from_slice(&t.media_time_scale.to_be_bytes());
         body.extend_from_slice(&(duration as u32).to_be_bytes());
     }
@@ -950,7 +1081,7 @@ fn build_dinf() -> Vec<u8> {
     let mut dref_body = Vec::new();
     dref_body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
     dref_body.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-                                                      // "url " box, FullBox, flags=1 means "self-contained, no location".
+    // "url " box, FullBox, flags=1 means "self-contained, no location".
     let mut url_body = Vec::new();
     url_body.extend_from_slice(&[0, 0, 0, 1]);
     dref_body.extend_from_slice(&wrap_box(b"url ", &url_body));
@@ -1004,9 +1135,17 @@ fn build_stbl_with_sample_groups(
 
 fn build_stsd(t: &TrackState) -> Vec<u8> {
     let mut body = Vec::new();
-    body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+    // ISO/IEC 14496-12 §8.5.2.2: an AudioSampleEntryV1 (entry version
+    // 1 in the first 16 bits after `data_reference_index`) may only
+    // appear in a version-1 SampleDescriptionBox.
+    let entry = &t.sample_entry.body;
+    let audio_v1 = t.stream.params.media_type == MediaType::Audio
+        && entry.len() >= 28
+        && entry[8..10] == [0, 1];
+    body.push(u8::from(audio_v1)); // version
+    body.extend_from_slice(&[0, 0, 0]); // flags
     body.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-                                                 // The sample entry is itself a box of type = `fourcc`, size = 8 + body.len().
+    // The sample entry is itself a box of type = `fourcc`, size = 8 + body.len().
     body.extend_from_slice(&wrap_box(&t.sample_entry.fourcc, &t.sample_entry.body));
     wrap_box(b"stsd", &body)
 }
@@ -1047,7 +1186,7 @@ fn build_stsc(runs: &[(u32, u32, u32)]) -> Vec<u8> {
 fn build_stsz(sizes: &[u32]) -> Vec<u8> {
     let mut body = Vec::with_capacity(12 + sizes.len() * 4);
     body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
-                                           // If all sizes are the same, use uniform. Otherwise 0 + per-sample table.
+    // If all sizes are the same, use uniform. Otherwise 0 + per-sample table.
     let uniform = if !sizes.is_empty() && sizes.iter().all(|&s| s == sizes[0]) {
         sizes[0]
     } else {
@@ -1120,12 +1259,12 @@ pub(crate) fn default_samples_per_chunk(stream: &StreamInfo) -> u32 {
 
 fn compute_delta(t: &TrackState, packet: &Packet, pts_in_ts: Option<i64>) -> u32 {
     // Preferred: use packet.duration if present, rescaled to media timescale.
-    if let Some(d) = packet.duration {
-        if d > 0 {
-            let v = rescale_to_media_ts(d, packet.time_base, t.media_time_scale);
-            if v > 0 {
-                return v as u32;
-            }
+    if let Some(d) = packet.duration
+        && d > 0
+    {
+        let v = rescale_to_media_ts(d, packet.time_base, t.media_time_scale);
+        if v > 0 {
+            return v as u32;
         }
     }
     // Otherwise: diff against previous packet's PTS.

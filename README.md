@@ -16,8 +16,6 @@ framework but usable standalone.
 ```toml
 [dependencies]
 oxideav-core = "0.1"
-oxideav-codec = "0.1"
-oxideav-container = "0.1"
 oxideav-mp4 = "0.0"
 ```
 
@@ -26,23 +24,23 @@ oxideav-mp4 = "0.0"
 ### Demux an MP4 and feed packets into a codec
 
 ```rust
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
+use oxideav_core::{ReadSeek, RuntimeContext};
 
-let mut codecs = CodecRegistry::new();
-let mut containers = ContainerRegistry::new();
-oxideav_mp4::register(&mut containers);
-// ... register whichever codecs you care about (aac, flac, h264, mjpeg, ...)
+let mut ctx = RuntimeContext::new();
+oxideav_mp4::register(&mut ctx);
+// ... register whichever codecs you care about (aac, flac, h264, mjpeg, ...),
+// or everything at once with `oxideav_meta::register_all(&mut ctx)`.
 
-let input: Box<dyn oxideav_container::ReadSeek> =
-    Box::new(std::fs::File::open("clip.mp4")?);
-let mut dmx = containers.open("mp4", input)?;
+let input: Box<dyn ReadSeek> = Box::new(std::fs::File::open("clip.mp4")?);
+let mut dmx = ctx.containers.open_demuxer("mp4", input, &ctx.codecs)?;
 
 // Sample entries are resolved to concrete codec ids. For `mp4a`/`mp4v`
 // tracks the esds `objectTypeIndication` is honoured, so MP3-in-mp4
 // comes out as "mp3", MPEG-1 video as "mpeg1video", AAC as "aac", etc.
-let stream = &dmx.streams()[0];
-let mut dec = codecs.make_decoder(&stream.params)?;
+let params = dmx.streams()[0].params.clone();
+let mut dec = ctx.codecs.first_decoder(&params)?;
+// (or `oxideav_pipeline::make_decoder(&ctx.codecs, &params)` for
+// priority / preference-aware selection among several implementations)
 
 loop {
     match dmx.next_packet() {
@@ -63,7 +61,9 @@ loop {
 ### Mux packets into an MP4
 
 ```rust
-use oxideav_container::WriteSeek;
+use oxideav_core::WriteSeek;
+# let streams: Vec<oxideav_core::StreamInfo> = Vec::new();
+# let packets: Vec<oxideav_core::Packet> = Vec::new();
 
 let f = std::fs::File::create("out.mp4")?;
 let ws: Box<dyn WriteSeek> = Box::new(f);
@@ -78,6 +78,8 @@ mux.write_trailer()?;
 
 ```rust
 use oxideav_mp4::{BrandPreset, Mp4MuxerOptions};
+# let ws: Box<dyn oxideav_core::WriteSeek> = Box::new(std::fs::File::create("out.mp4")?);
+# let streams: Vec<oxideav_core::StreamInfo> = Vec::new();
 
 let opts = Mp4MuxerOptions {
     brand: BrandPreset::Mp4,
@@ -85,6 +87,7 @@ let opts = Mp4MuxerOptions {
     ..Mp4MuxerOptions::default()
 };
 let mut mux = oxideav_mp4::muxer::open_with_options(ws, &streams, opts)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 In faststart mode the muxer buffers mdat in memory and writes
@@ -1576,6 +1579,44 @@ subsequent movie fragments") — e.g. a `media_time = 1024, duration =
 0` entry cuts AAC priming ahead of the first presented CMAF sample
 across every fragment.
 
+Header timestamps (`mvhd` §8.2.2, `tkhd` §8.3.2, `mdhd` §8.4.2)
+default to zero — the historical output and the "unset" reading.
+`Mp4MuxerOptions::creation_time` stamps all three, in the ISOBMFF
+epoch: seconds since 1904-01-01 UTC, not the Unix one
+(`mp4_secs_from_unix_secs` / `mp4_secs_from_system_time` convert and
+reject pre-1904 instants; `unix_secs_from_mp4_secs` goes back;
+`MP4_EPOCH_OFFSET_SECS` is the raw constant). One value fills both
+`creation_time` and `modification_time` of each box — the common case
+of a file created and last modified at one instant — while
+`Mp4MuxerOptions::modification_time` drives the two apart. Per-track
+overrides go in `Mp4MuxerOptions::track_header_timestamps`, a list of
+`TrackHeaderTimestamps` keyed by `stream_index` whose `track` is the
+`tkhd` pair and `media` the `mdhd` one (§8.4.2 dates the media, §8.3.2
+the track, and a producer may stamp them apart). An entry replaces the
+pair it names rather than inheriting either half from the movie-wide
+options; `media: None` reusing `track` is the only defaulting step.
+`mvhd` keeps the movie-wide values, and an out-of-range index fails at
+`open`. A timestamp past 2040-02-06 in either half — where the value
+crosses `u32::MAX` — promotes that box from version 0 to version 1
+with 64-bit time and duration fields, the same auto-promotion the
+over-32-bit durations get. The plain, faststart and fragmented
+(init-segment) paths all honour it.
+
+The demuxer surfaces the same three pairs in the same units:
+`Mp4Demuxer::mvhd_timestamps()`, `::tkhd_timestamps(stream)` and
+`::mdhd_timestamps(stream)` (the latter two `None` for an unknown
+stream) return a `demux::HeaderTimestamps`, with the version 0 and
+version 1 layouts both widened to `u64` on intake. The same values
+appear on the flat metadata channel as `mvhd_creation_time` /
+`mvhd_modification_time` and the per-stream `tkhd_*` / `mdhd_*`
+equivalents, each emitted only when non-zero — zero is the "unset"
+encoding most files carry, and `HeaderTimestamps::is_unset` is the
+typed form of that check. The two surfaces reach the same six fields,
+so a remuxer carries a source's stamps across unchanged: same epoch,
+same units, no conversion. The HEIF item properties `crtt` / `mdft`
+are a separate surface — same 1904 origin, but microseconds, so these
+helpers do not apply to them.
+
 Sample groups (`sbgp` / `sgpd` / `csgp`, ISO/IEC 14496-12 §8.9.2 /
 §8.9.3 / §8.9.5) are emitted per-track when supplied via
 `Mp4MuxerOptions::track_sample_groups` (a list of `TrackSampleGroups`,
@@ -1835,40 +1876,94 @@ first that applies:
 ## Container registry
 
 ```rust
-let mut reg = oxideav_container::ContainerRegistry::new();
-oxideav_mp4::register(&mut reg);
+let mut ctx = oxideav_core::RuntimeContext::new();
+oxideav_mp4::register(&mut ctx);
+// or, with a bare container registry:
+let mut reg = oxideav_core::ContainerRegistry::new();
+oxideav_mp4::register_containers(&mut reg);
 ```
 
 Registers:
 
 - Demuxer `"mp4"` (also serving `.mp4`, `.m4a`, `.m4v`, `.3gp`, `.mov`,
   `.ismv`).
-- Muxers `"mp4"`, `"mov"`, `"ismv"`.
+- Muxers `"mp4"`, `"mov"`, `"ismv"`, and the fragmented `"dash"` /
+  `"cmaf"` (`.m4s`).
 - A content probe that recognises `ftyp` / `wide`+`ftyp` / `moov`.
 
 ## Fuzzing
 
-A `cargo-fuzz` target exercises the BMFF box-tree walker on
-arbitrary bytes:
+Six `cargo-fuzz` targets exercise the BMFF surface, sharing an
+`oxideav_mp4_fuzz` library (a `Recipe` byte-reader, a
+valid-by-construction `MuxPlan`, and a full-accessor demux battery):
 
 ```sh
 cd fuzz
-cargo +nightly fuzz run demux
+cargo +nightly fuzz run demux            # arbitrary bytes → open-or-error
+cargo +nightly fuzz run box_parsers      # every standalone box parser
+cargo +nightly fuzz run mux_roundtrip    # mux → demux byte-exact identity
+cargo +nightly fuzz run structured_mutate # corrupt writer-shaped fixtures
+cargo +nightly fuzz run meta_graph       # HEIF item graphs
+cargo +nightly fuzz run cenc_roundtrip   # encrypt∘decrypt identity
 ```
 
-The target opens, drains up to 256 packets, and re-seeks; it asserts
-nothing panics, aborts, or OOMs. Seed corpus + regression artefacts
-live at `fuzz/corpus/demux/`. The fuzz crate has its own `[workspace]`
-and a committed `Cargo.lock` for reproducibility.
+- **`demux`** — arbitrary bytes through `open_typed`, then the whole
+  public accessor set (CENC / PIFF / `emsg` / HEIF item resolution /
+  edit lists / fragment records / `resolve_sai_aux_info` so the
+  attacker-controlled `saiz`/`saio` seek + §7.1 cell-parse path is
+  covered), a 256-packet drain, and both seek paths. Asserts
+  open-or-error, never a panic / abort / OOM.
+- **`box_parsers`** — hostile bytes through every standalone public
+  box parser, asserting a **parse∘build fixed-point** wherever the
+  byte-exact builder dual exists (parser and builder must agree on the
+  wire format, not merely not-crash).
+- **`mux_roundtrip`** — valid-by-construction recipes must mux and
+  re-demux byte-exactly (payloads + pts) across plain / faststart /
+  fragmented (incl. `styp` + `sidx`/`mfra`) layouts, with pts identity
+  held exact through the media↔movie timescale rescale and a
+  start-delay `elst`.
+- **`structured_mutate`** — writer-shaped fixtures with fuzz-directed
+  byte flips, truncations, and targeted overwrites right after the
+  sample-table / fragment / index FourCCs the offset walkers
+  arithmetic on.
+- **`meta_graph`** — builder-assembled `iloc`/`iinf`/`iref`/`ipma`
+  catalogues (every construction method, reference cycles, out-of-range
+  property indexes) reparse identically, then survive hostile mutation
+  of the `meta` body.
+- **`cenc_roundtrip`** — encrypt∘decrypt identity under
+  arbitrary-but-valid §10 scheme × `tenc` × subsample-partition
+  metadata, plus hostile `plan_sample_cipher` / `senc` / `seig` walks.
 
-The target opens via `open_typed`, drains up to 256 packets, re-seeks,
-and re-walks the input through `resolve_sai_aux_info` (so the
-attacker-controlled `saiz`/`saio` seek + fetch + §7.1 cell-parse path
-is under fuzz too). The corpus includes muxer-produced fragmented
-seeds — a sealed-`mehd` file with an empty-time gap fragment, and a
-senc-stripped CENC file carrying the `saiz`/`saio` aux-info form.
+Each target asserts nothing panics, aborts, or OOMs (round-trip
+targets additionally assert their identity contract). Seed corpus +
+regression artefacts live under `fuzz/corpus/<target>/`. The fuzz
+crate has its own `[workspace]` and a committed `Cargo.lock` for
+reproducibility; a daily `Fuzz` workflow runs the whole battery. The
+corpus includes muxer-produced fragmented seeds — a sealed-`mehd` file
+with an empty-time gap fragment, and a senc-stripped CENC file
+carrying the `saiz`/`saio` aux-info form.
 
 Pinned regressions worth calling out:
+
+* **`tcmi` / `text` Pascal-string round-trip** (§12) — a `font_name`
+  longer than the 255-byte Pascal ceiling (the lossy U+FFFD expansion
+  of non-UTF-8 wire bytes triples the byte length) was truncated at a
+  raw byte index, slicing a multi-byte char and growing a
+  replacement-character tail on reparse. The builders now truncate on
+  a char boundary. Pinned as `regression_tcmi_overlong_lossy_name.bin`.
+* **`fd` / `hint` child-walker overflow** (§4.2) — a hostile
+  `largesize` near `u64::MAX` (or an oversize `size32`) overflowed the
+  `pos + total` bound check before it could reject the child. Both
+  walkers now bound with `checked_add`. Pinned as
+  `regression_fd_largesize_overflow.bin`.
+* **Extended-size u64 overflow** — a `size=1 largesize=u64::MAX`
+  extended box anchored at a non-zero file offset used to overflow
+  every downstream `body_start + payload_size` arithmetic site
+  (the §8.16.3 `sidx` end-anchor computation is the most exposed
+  example). `read_box_header` now `checked_add`s `start + total_size`
+  and rejects the header before any caller computes a derived end
+  byte. Replayed by `tests/largesize_overflow.rs` and two boundary
+  unit tests in `src/boxes.rs`.
 
 * **Extended-size u64 overflow** — a `size=1 largesize=u64::MAX`
   extended box anchored at a non-zero file offset used to overflow

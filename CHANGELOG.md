@@ -7,7 +7,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
+### Fixed
+
+- AAC could not be muxed into MP4: an AAC stream without extradata was
+  refused ("missing extradata"), and ADTS-framed packets would have
+  been stored with their headers in `mdat`. The muxers (plain,
+  faststart, fragmented) now strip ADTS headers so each sample is one
+  bare access unit (ISO/IEC 14496-14 §3.1.2), and synthesise the `esds`
+  AudioSpecificConfig when the stream carries none — from the first
+  ADTS header (non-fragmented) or from the stream's rate / channels.
+- HE-AAC tracks whose `mp4a` sample entry carries the AAC core rate are
+  reported at the SBR output rate the AudioSpecificConfig declares (the
+  rate the decoder emits).
+- `.mov` mapped to the `mov` container, which had a muxer but no
+  demuxer in an MP4-only registry; the MP4 demuxer is now registered as
+  the `mov` demuxer unless another QuickTime demuxer already holds it.
+
 ### Added
+
+- Edit list for decode pre-roll: a track whose first packet has a
+  negative PTS (e.g. AAC priming carried over from a trimmed source)
+  gets one `elst` entry with `media_time = -first_pts` running to the
+  end of the presented range.
+- Header timestamps on the muxer (ISO/IEC 14496-12 §8.2.2 `mvhd` / §8.3.2 `tkhd` / §8.4.2 `mdhd`), previously hardcoded to zero: `Mp4MuxerOptions::creation_time` stamps all three in the header epoch — seconds since 1904-01-01 UTC, converted by the public `mp4_secs_from_unix_secs` / `mp4_secs_from_system_time` (`None` before 1904), its inverse `unix_secs_from_mp4_secs`, and the `MP4_EPOCH_OFFSET_SECS` constant. One value fills both `creation_time` and `modification_time` of each box; `Mp4MuxerOptions::modification_time` drives them apart. `Mp4MuxerOptions::track_header_timestamps` (new `TrackHeaderTimestamps` record — `track` is the `tkhd` pair, `media` the `mdhd` one) replaces the pair for the stream it names rather than inheriting either half, `media: None` reusing `track` being the only defaulting step; `mvhd` keeps the movie-wide values and out-of-range indices fail at `open`. A value past 2040-02-06 in either half promotes that box to version 1 with 64-bit time + duration fields, per box and automatic. Plain, faststart and fragmented init-segment paths all honour it; the default `None` keeps the all-zero version-0 headers byte-identical to the historical output
+
+- Header-timestamp read side: `Mp4Demuxer::mvhd_timestamps()` / `::tkhd_timestamps(stream)` / `::mdhd_timestamps(stream)` return the new `demux::HeaderTimestamps` (`creation_time` + `modification_time`, `is_unset()` for the all-zero encoding; re-exported at the crate root, since the muxer options take it too) in the boxes' own units, so a value read here feeds straight back into the muxer — the two surfaces reach the same six fields, making a remux carry-across lossless. `tkhd` and `mdhd` stay separate rather than collapsing, since a producer may date the media apart from the track; v0 and v1 layouts both widen to `u64`, read by one shared reader for all three boxes. Flat metadata mirrors as `mvhd_creation_time` / `mvhd_modification_time` and the per-stream `tkhd_*` / `mdhd_*`, emitted only when non-zero so an unstamped file adds no keys. 15 integration tests (six distinct values byte-patched into the six fields, so a swapped or shared read cannot pass; a PATH-gated cross-check reading back a stamp written by `ffmpeg`; v1 promotion across the plain, faststart and fragmented paths)
+- `HeaderTimestamps` and `TrackHeaderTimestamps` are `#[non_exhaustive]`; build them with `HeaderTimestamps::new` / `::stamped` / `with_creation_time` / `with_modification_time` and `TrackHeaderTimestamps::new` / `with_media`.
+
+## [0.0.10](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.9...v0.0.10) - 2026-08-15
+
+### Other
+
+- structure-aware MP4/ISOBMFF battery — 6 targets, 3 hostile-input fixes
+- §8.8.12 mfro surfacing + trailer-size cross-check
+- fuzz-campaign hardening — five unbacked-allocation shapes fixed
+- resolve_sai_aux_info — bridge the senc-less CENC carriage
+- insert_empty_time — §8.8.6.1 empty-insert write side
+- §8.8.2 mehd write side — sealed fragmented duration
+- §8.8.7 duration-is-empty track fragments
+- foreign-file elst equivalence pin + README seek-path accuracy
+- start_time from the mapped §8.6.6 timeline + seek/hostile pins
+- per-packet sample_description_index surfacing
+- explicit edit lists reach the fragmented init segment
+- explicit per-track edit lists on the muxer
+- typed §8.6.6 edit-list public surface
+- full §8.6.6 edit-list timeline mapping on demux
+- mark internal boxes module #[doc(hidden)]
+- emsg v0-delta absolute-time resolver + PIFF truncation sweeps
+- wire PIFF uuid boxes + emsg into demux surface and fragment writer
+- PIFF legacy uuid encryption boxes + DASH emsg byte layer
+- README + CHANGELOG — round 396 self-describing CENC packaging docs
+- CENC×index interplay hardening + EveryKeyframe final-sample fix
+- CencFragmentPackager — plaintext-in, protected-fMP4-out write driver
+- packager→demux→decrypt round-trip gate — every §10 scheme × fragmented shape
+- seig key-rotation signalling on write — fragment-local sgpd/sbgp
+- per-fragment senc + saiz/saio emission through write_protected_packet
+- CENC seig group-entry serialiser (§6 write side)
+- add CI / crates.io / docs.rs / MIT-license badges
+- moof-level pssh emission for per-fragment key rotation
+- CENC protected-track muxing — sinf envelope + moov-level pssh emission
+- CENC write-side foundations — tenc/pssh/senc builders + AES encrypt driver
+- muxer codec write-side coverage x12 — h265/av1/vp9/vp8/h263 + opus/alac/ac3/eac3/mp3/G.711
+- commit stranded pnot integration test
+- QuickTime track load settings atom (trak/load) read + build
+- QuickTime text sample description (text stsd entry) read + build
+- QuickTime timecode sample description (tmcd stsd entry) read + build
+- QuickTime timecode media info atom (tcmi §gmhd) read + build
+- QuickTime base media info header (gmhd/gmin §minf) read + build
+- HEIF item-properties crtt/mdft timestamps + README
+- HEIF item-properties extended set (udes/altt/iscl/rref)
+- surface per-item iloc/iref catalogue detail on metadata channel
+- HEIF entity-grouping family (grpl/EntityToGroupBox)
+- HEIF item-properties family (iprp/ipco/ipma + property boxes)
+- README — document r375 box builders (tref/trgr/kind/cprt/tsel/strk/subs/saiz/saio/pdin/prft write side)
+- saiz/saio (Sample Auxiliary Info Sizes/Offsets §8.7.8-9) public surface
+- subs (SubSampleInformationBox §8.7.7) public parse + build surface
+- prft (ProducerReferenceTimeBox §8.16.5) standalone builder
+- pdin (ProgressiveDownloadInfoBox §8.1.3) builder
+- trgr (TrackGroupBox §8.3.4) builder
+- cprt/kind/tsel track-udta selection-box builders (§8.10)
+- sub-track (strk/stri/strd/stsg §8.14) builders
+- tref (TrackReferenceBox §8.3.3) builder
+- document hint sample entries, hinf, FD item info, meco/mere
+- hinf Hint Statistics Box parse+build (§9.1.5)
+- rtcp reception + MPEG-2 TS (sm2t/rm2t) hint sample entries
+- RTP/SRTP/reception hint sample-entry family (§9.1.2 / §9.4.1.2)
+- meco/mere Additional Metadata Container family (§8.11.7/8)
+- FD Item Information family parse+build (§8.13 / §9.2.4.7)
+- pasp/clap/colr box builders (§12.1.4-5)
+- demux VisualSampleEntry pasp/clap/colr boxes (§12.1.4-5)
+- §8.11 meta-item box builders (iloc/pitm/iinf/iref/idat)
+- demux idat capture + item-byte resolution (§8.11.11 / §8.11.3.3)
+- demux file-level meta item infrastructure (iloc/pitm/iinf/iref, §8.11)
+- parse fragment-local sample groups (sgpd/sbgp/csgp in traf, §8.9)
+- wire csgp (CompactSampleToGroupBox §8.9.5) into non-fragmented muxer
+- trep + assp fragmented-mux emission (§8.8.15 / §8.8.16)
+- typed assp AlternativeStartupSequencePropertiesBox in trep (§8.8.16)
+- add build_stvi_box write side + stvi integration round-trip tests
+- parse stvi (StereoVideoBox, §8.15.4.2) from sample-entry sinf/schi
+- ssix SubsegmentIndexBox emission after each sidx (ISO/IEC 14496-12 §8.16.4)
+- leva LevelAssignmentBox emission in init mvex (ISO/IEC 14496-12 §8.8.13)
+- build_leva_box LevelAssignmentBox builder (ISO/IEC 14496-12 §8.8.13)
+- large_mdat option for 64-bit largesize mdat header (§4.2)
+- document prft muxing; drop stale "no fragmented muxing" bullet
+- prft ProducerReferenceTimeBox muxing (ISO/IEC 14496-12 §8.16.5)
+- document typed §10 sample-group description entries
+- decode_sample_group_entry dispatch + SampleGroupEntry
+- rash RateShareEntry (§10.2.2) + CHANGELOG
+- alst AlternativeStartupEntry (§10.3.2)
+- rap/tele/sap single-byte bit-packed entries
+- typed roll/prol RollRecoveryEntry (§10.1.1)
+- capture 2022-edition flags annotating what the NTP time represents
+- enforce §8.9.5 pattern/count 4-bit-width agreement constraint
+- csgp pattern → sample expansion: CsgpBox::resolve_samples (§8.9.5)
+- capture index_msb_indicates_fragment_local_description (flag bit 7) + width-aware MSB resolver
+- parse btrt BitRateBox in sample entries (ISO/IEC 14496-12 §8.5.2)
+- parse amve AmbientViewingEnvironmentBox inside VisualSampleEntry
+- csgp CompactSampleToGroupBox builder (ISO/IEC 14496-12:2020 §8.9.5)
+- demux hmhd HintMediaHeaderBox (ISO/IEC 14496-12 §12.4.2)
+- refresh to current status, drop per-round changelog cruft
+
+### Added
+
+- Structure-aware fuzz surface expanded from one demux-only target to six (shared `oxideav_mp4_fuzz` scaffolding: a `Recipe` byte-reader, a valid-by-construction `MuxPlan`, and a full-accessor demux battery). New targets: `box_parsers` (hostile bytes through every standalone public box parser — HEIF item catalogue, CENC/PIFF, `emsg`, FD, hint, sample-group blobs, QuickTime atoms, aux-info/random-access records — with parse∘build fixed-point asserts wherever a byte-exact builder dual exists); `mux_roundtrip` (valid recipes must mux and re-demux byte-exactly across plain / faststart / fragmented — incl. `styp` + `sidx`/`mfra` — layouts, with exact pts identity through the media/movie timescale rescale and start-delay `elst`); `structured_mutate` (byte flips / truncations / targeted corruption right after the sample-table, fragment, and index FourCCs the offset walkers arithmetic on); `meta_graph` (builder-assembled `iloc`/`iinf`/`iref`/`ipma` catalogues — every construction method, reference cycles, out-of-range property indexes — reparse identically, then survive hostile mutation of the `meta` body); and `cenc_roundtrip` (encrypt∘decrypt identity under arbitrary-but-valid §10 scheme × `tenc` × subsample-partition metadata, plus hostile `plan_sample_cipher` / `senc` / `seig` walks). The retooled `demux` target now drives the whole public accessor set (CENC / PIFF / `emsg` / HEIF item resolution / edit lists / fragment records) plus both seek paths. Bounded inline ASan campaigns (5.9M+ execs total across targets) found and fixed three defects, each pinned as a fuzz-corpus regression + covered by a unit test:
+  - **`tcmi` / `text` Pascal-string round-trip corruption** (`build_tcmi_box` / `build_text_sample_entry`, ISO/IEC 14496-12 §12): a `font_name` longer than the 255-byte Pascal length ceiling — which arises when the parser lossily replaces non-UTF-8 wire bytes (each expands to a 3-byte U+FFFD) — was truncated at a raw byte index, slicing a multi-byte char and re-growing a replacement-character tail on reparse. The builders now truncate on a char boundary, so an over-long name rebuilds to a clean UTF-8 prefix.
+  - **`fd::each_child` / `hint::each_child` box-walker overflow** (ISO/IEC 14496-12 §4.2): a hostile `largesize`-encoded child near `u64::MAX` (or an oversize `size32`) overflowed the `pos + total` bound check before it could reject the child. Both walkers now bound with `checked_add`, dropping the malformed child and terminating the walk cleanly.
+- Daily `Fuzz` workflow (fleet `crate-fuzz.yml` shim, 05:23 UTC) — previously absent for this crate.
 
 - `mfro` surfacing (ISO/IEC 14496-12 §8.8.12): the trailer's declared enclosing-`mfra` size appears as the `mfro_size` metadata key, with a `mfro_size_mismatch` key (`declared=<d> actual=<a>`) when it disagrees with the mfra measured on disk — validating the last-16-bytes locator shortcut without affecting the open or the seek table. Integration test covers own-muxer match + byte-corrupted mismatch
 

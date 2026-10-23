@@ -13,6 +13,11 @@ pub mod boxes;
 pub mod cenc;
 pub mod cenc_cipher;
 pub mod cenc_packager;
+// Internal plumbing: sample-entry FourCC -> oxideav codec-id mapping used
+// by the demuxer. Not part of the stable API (the README documents no
+// `codec_id::` surface); `pub` only so tests can reach it.
+mod aac;
+#[doc(hidden)]
 pub mod codec_id;
 pub mod demux;
 pub mod emsg;
@@ -27,9 +32,14 @@ pub mod sample_groups;
 pub mod styp;
 
 pub use options::{
-    BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions, TrackEditList,
-    TrackProtection, TrackSampleGroups,
+    BrandPreset, FragmentCadence, FragmentedOptions, MP4_EPOCH_OFFSET_SECS, Mp4MuxerOptions,
+    TrackEditList, TrackHeaderTimestamps, TrackProtection, TrackSampleGroups,
+    mp4_secs_from_system_time, mp4_secs_from_unix_secs, unix_secs_from_mp4_secs,
 };
+// The header-timestamp pair is written through `Mp4MuxerOptions` and
+// read back off `Mp4Demuxer`, so it belongs at the root alongside the
+// options types even though it is defined in `demux`.
+pub use demux::HeaderTimestamps;
 
 use oxideav_core::ContainerRegistry;
 
@@ -37,6 +47,17 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_demuxer("mp4", demux::open);
     reg.register_muxer("mp4", muxer::open);
     reg.register_muxer("mov", muxer::open_mov);
+    // `.mov` maps to the "mov" container name, which this crate also
+    // muxes. QuickTime movies share the ISO-BMFF box structure the MP4
+    // demuxer walks, so install it as the "mov" demuxer too — but only
+    // when nothing else has claimed the name: a dedicated QuickTime
+    // demuxer (oxideav-mov) registered before us keeps the slot, and one
+    // registered after us replaces this alias. Without the alias an
+    // MP4-only registry knew `.mov` but could not open one unless the
+    // content probe happened to route it to "mp4".
+    if !reg.demuxer_names().any(|n| n == "mov") {
+        reg.register_demuxer("mov", demux::open);
+    }
     reg.register_muxer("ismv", muxer::open_ismv);
     // Fragmented MP4: emit init-segment (ftyp+moov+mvex) then per-fragment
     // styp+moof+mdat. Default cadence: every 2 seconds (see
@@ -103,5 +124,27 @@ mod tests {
         assert_eq!(ctx.containers.container_for_extension("mp4"), Some("mp4"));
         assert_eq!(ctx.containers.container_for_extension("mov"), Some("mov"));
         assert_eq!(ctx.containers.container_for_extension("m4s"), Some("dash"));
+        // `.mov` resolves to a container that can be demuxed as well as muxed.
+        assert!(ctx.containers.demuxer_names().any(|n| n == "mov"));
+        assert!(ctx.containers.muxer_names().any(|n| n == "mov"));
+    }
+
+    #[test]
+    fn mov_alias_does_not_displace_a_registered_quicktime_demuxer() {
+        fn other(
+            _: Box<dyn oxideav_core::ReadSeek>,
+            _: &dyn oxideav_core::CodecResolver,
+        ) -> oxideav_core::Result<Box<dyn oxideav_core::Demuxer>> {
+            Err(oxideav_core::Error::unsupported("sentinel"))
+        }
+        let mut reg = ContainerRegistry::new();
+        reg.register_demuxer("mov", other);
+        register_containers(&mut reg);
+        let codecs = oxideav_core::CodecRegistry::new();
+        let err = reg
+            .open_demuxer("mov", Box::new(std::io::Cursor::new(Vec::new())), &codecs)
+            .err()
+            .expect("sentinel demuxer error");
+        assert!(err.to_string().contains("sentinel"), "{err}");
     }
 }
